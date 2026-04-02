@@ -1,11 +1,13 @@
 //! GooseOS — A RISC-V operating system written in Rust
 //!
-//! Part 2: print!/println! macros + panic handler with UART output.
+//! Part 3: Trap handling + PLIC interrupts + interrupt-driven UART.
 
 #![no_std]
 #![no_main]
 
 mod console;
+mod plic;
+mod trap;
 mod uart;
 
 use core::arch::{asm, global_asm};
@@ -24,11 +26,10 @@ const UART0_BASE: usize = 0x1000_0000;
 /// * `dtb_addr` - Device tree blob address (from OpenSBI via a1)
 #[no_mangle]
 pub extern "C" fn kmain(hart_id: usize, dtb_addr: usize) -> ! {
-    // Initialize UART hardware before any printing
+    // === Phase 1: UART init (polling) ===
     let uart = uart::Uart::new(UART0_BASE);
     uart.init();
 
-    // Now we can use println! everywhere
     println!();
     println!("          __");
     println!("       __( o)>     GooseOS v0.1.0");
@@ -39,26 +40,44 @@ pub extern "C" fn kmain(hart_id: usize, dtb_addr: usize) -> ! {
     println!("      ~~~^~~~~");
     println!();
 
-    // Formatted output — the whole point of Part 2!
     println!("  Booted on hart {}", hart_id);
     println!("  DTB address:   {:#010x}", dtb_addr);
     println!("  Kernel entry:  {:#010x}", kmain as *const () as usize);
     println!();
-    println!("  Hello from GooseOS!");
+
+    // === Phase 2: Set up trap vector (but don't enable IRQs yet) ===
+    trap::trap_init();
+
+    // === Phase 3: Configure PLIC ===
+    plic::init();
+
+    // === Phase 4: Enable UART RX interrupts ===
+    uart.enable_rx_interrupt();
+    println!("  [uart] RX interrupts enabled");
+
+    // === Phase 5: Arm the timer ===
+    trap::timer_init();
+
+    // === Phase 6: Go live — enable interrupts globally ===
+    trap::interrupts_enable();
+
+    println!();
+    println!("  Interrupts active! Type something...");
+    println!("  (timer ticks every 10s, Ctrl-A X to exit QEMU)");
     println!();
 
-    // Halt — nothing else to do yet.
+    // Idle loop — wakes on each interrupt, then sleeps again
     loop {
         unsafe { asm!("wfi") };
     }
 }
 
 /// Panic handler — prints location and message, then halts.
-///
-/// This is critical for debugging: without it, any bug
-/// (array OOB, unwrap on None, explicit panic) just silently hangs.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Disable interrupts so panic output isn't interleaved
+    unsafe { asm!("csrc sstatus, {}", in(reg) 1usize << 1); }
+
     println!();
     println!("!!! KERNEL PANIC !!!");
 
