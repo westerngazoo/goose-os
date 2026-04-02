@@ -1,48 +1,63 @@
-/// NS16550A UART driver for QEMU virt machine.
+/// NS16550A / DW8250-compatible UART driver.
 ///
-/// Register map (offsets from base address):
-///   0x00  THR  - Transmit Holding Register (write)
-///   0x00  RBR  - Receive Buffer Register (read)
-///   0x01  IER  - Interrupt Enable Register
-///   0x02  FCR  - FIFO Control Register (write)
-///   0x03  LCR  - Line Control Register
-///   0x05  LSR  - Line Status Register
+/// Supports two register strides:
+///   - 1 byte  (QEMU virt, standard NS16550A)
+///   - 4 bytes (VisionFive 2, DesignWare 8250)
 ///
-/// All registers are 8-bit (byte-wide) MMIO.
+/// Register indices (multiplied by stride for actual offset):
+///   0  THR/RBR  - Transmit/Receive
+///   1  IER      - Interrupt Enable
+///   2  FCR/IIR  - FIFO Control / Interrupt ID
+///   3  LCR      - Line Control
+///   5  LSR      - Line Status
 
 use core::fmt;
 use core::ptr;
+use crate::platform;
 
 pub struct Uart {
     base: usize,
+    stride: usize,
 }
 
 impl Uart {
-    pub const fn new(base: usize) -> Self {
-        Uart { base }
+    pub const fn new(base: usize, stride: usize) -> Self {
+        Uart { base, stride }
+    }
+
+    /// Convenience: create a UART using platform defaults.
+    pub const fn platform() -> Self {
+        Uart {
+            base: platform::UART_BASE,
+            stride: platform::UART_REG_STRIDE,
+        }
+    }
+
+    /// Get the address of register at logical index.
+    #[inline(always)]
+    fn reg(&self, index: usize) -> *mut u8 {
+        (self.base + index * self.stride) as *mut u8
     }
 
     /// Initialize UART: 8-bit words, FIFOs enabled, no interrupts.
     pub fn init(&self) {
-        let base = self.base as *mut u8;
         unsafe {
             // LCR: 8 data bits, 1 stop bit, no parity
-            ptr::write_volatile(base.add(3), 0x03);
+            ptr::write_volatile(self.reg(3), 0x03);
             // FCR: enable FIFOs
-            ptr::write_volatile(base.add(2), 0x01);
+            ptr::write_volatile(self.reg(2), 0x01);
             // IER: disable all interrupts (for now)
-            ptr::write_volatile(base.add(1), 0x00);
+            ptr::write_volatile(self.reg(1), 0x00);
         }
     }
 
     /// Write a single byte, waiting until the transmitter is ready.
     pub fn putc(&self, c: u8) {
-        let base = self.base as *mut u8;
         unsafe {
             // Spin until LSR bit 5 (THR empty) is set
-            while ptr::read_volatile(base.add(5)) & (1 << 5) == 0 {}
+            while ptr::read_volatile(self.reg(5)) & (1 << 5) == 0 {}
             // Write the character to THR
-            ptr::write_volatile(base.add(0), c);
+            ptr::write_volatile(self.reg(0), c);
         }
     }
 
@@ -59,21 +74,19 @@ impl Uart {
     /// Enable receive-data-available interrupts.
     /// Call this AFTER PLIC is configured, BEFORE interrupts_enable().
     pub fn enable_rx_interrupt(&self) {
-        let base = self.base as *mut u8;
         unsafe {
             // IER bit 0 (ERBFI): interrupt when RX data is available
             // Keep bit 1 (ETBEI) clear — TX stays polling
-            ptr::write_volatile(base.add(1), 0x01);
+            ptr::write_volatile(self.reg(1), 0x01);
         }
     }
 
     /// Non-blocking read. Returns Some(byte) if data is available.
     pub fn getc(&self) -> Option<u8> {
-        let base = self.base as *mut u8;
         unsafe {
             // LSR bit 0 (DR): data ready
-            if ptr::read_volatile(base.add(5)) & 1 != 0 {
-                Some(ptr::read_volatile(base.add(0)))
+            if ptr::read_volatile(self.reg(5)) & 1 != 0 {
+                Some(ptr::read_volatile(self.reg(0)))
             } else {
                 None
             }
@@ -82,10 +95,6 @@ impl Uart {
 }
 
 /// Implement core::fmt::Write so we can use write!() and friends.
-///
-/// This is the bridge between Rust's formatting machinery and our
-/// raw UART. Once this exists, we get formatted output for free:
-///   write!(uart, "hart {} at {:#x}", id, addr)
 impl fmt::Write for Uart {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.puts(s);
@@ -94,27 +103,20 @@ impl fmt::Write for Uart {
 }
 
 /// Handle a UART interrupt — drain the RX FIFO and echo characters.
-/// Called from the trap handler when PLIC claims IRQ 10.
 pub fn handle_interrupt() {
-    let uart = Uart::new(0x1000_0000);
-    // Drain all available characters from the FIFO
+    let uart = Uart::platform();
     while let Some(c) = uart.getc() {
         match c {
-            // Carriage return or newline → echo both
             b'\r' | b'\n' => {
                 uart.putc(b'\r');
                 uart.putc(b'\n');
             }
-            // Backspace (0x7F DEL or 0x08 BS) → erase
             0x7F | 0x08 => {
-                uart.putc(0x08); // move cursor back
-                uart.putc(b' '); // overwrite with space
-                uart.putc(0x08); // move cursor back again
+                uart.putc(0x08);
+                uart.putc(b' ');
+                uart.putc(0x08);
             }
-            // Regular character → echo it
-            _ => {
-                uart.putc(c);
-            }
+            _ => uart.putc(c),
         }
     }
 }

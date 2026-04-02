@@ -3,6 +3,11 @@ name = "goose-os"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["qemu"]
+qemu = []
+vf2 = []
+
 [profile.dev]
 panic = "abort"
 

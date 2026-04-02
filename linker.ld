@@ -40,6 +40,10 @@ SECTIONS
     /* Stack lives at the top of RAM, grows downward */
     _stack_top = ORIGIN(RAM) + LENGTH(RAM);
 
+    /* Boot hart ID — boot.S compares a0 against this.
+     * QEMU virt: hart 0 is the boot hart. */
+    _boot_hart_id = 0;
+
     /* Discard unneeded sections */
     /DISCARD/ : {
         *(.eh_frame)

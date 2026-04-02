@@ -1,11 +1,12 @@
 //! GooseOS — A RISC-V operating system written in Rust
 //!
-//! Part 3: Trap handling + PLIC interrupts + interrupt-driven UART.
+//! Part 4: Platform abstraction — runs on QEMU virt and VisionFive 2.
 
 #![no_std]
 #![no_main]
 
 mod console;
+mod platform;
 mod plic;
 mod trap;
 mod uart;
@@ -13,11 +14,7 @@ mod uart;
 use core::arch::{asm, global_asm};
 
 // Include the RISC-V assembly boot code.
-// This defines _start which the linker script places at 0x80200000.
 global_asm!(include_str!("boot.S"));
-
-/// QEMU virt machine UART0 base address (NS16550A compatible).
-const UART0_BASE: usize = 0x1000_0000;
 
 /// Kernel main — called from boot.S after stack setup.
 ///
@@ -27,7 +24,7 @@ const UART0_BASE: usize = 0x1000_0000;
 #[no_mangle]
 pub extern "C" fn kmain(hart_id: usize, dtb_addr: usize) -> ! {
     // === Phase 1: UART init (polling) ===
-    let uart = uart::Uart::new(UART0_BASE);
+    let uart = uart::Uart::platform();
     uart.init();
 
     println!();
@@ -35,8 +32,8 @@ pub extern "C" fn kmain(hart_id: usize, dtb_addr: usize) -> ! {
     println!("       __( o)>     GooseOS v0.1.0");
     println!("      \\  _/        RISC-V 64-bit");
     println!("       \\\\\\         Written in Rust");
-    println!("        \\\\\\__");
-    println!("         \\   )>    Honk.");
+    println!("        \\\\\\        Platform: {}", platform::PLATFORM_NAME);
+    println!("         \\   )_    Honk.");
     println!("      ~~~^~~~~");
     println!();
 
@@ -63,7 +60,11 @@ pub extern "C" fn kmain(hart_id: usize, dtb_addr: usize) -> ! {
 
     println!();
     println!("  Interrupts active! Type something...");
-    println!("  (timer ticks every 10s, Ctrl-A X to exit QEMU)");
+    if cfg!(feature = "qemu") {
+        println!("  (timer ticks every 10s, Ctrl-A X to exit QEMU)");
+    } else {
+        println!("  (timer ticks every 10s)");
+    }
     println!();
 
     // Idle loop — wakes on each interrupt, then sleeps again

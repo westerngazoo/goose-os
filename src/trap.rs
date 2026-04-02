@@ -9,16 +9,14 @@
 /// happened and dispatch accordingly.
 
 use core::arch::{asm, global_asm};
-use crate::{plic, println};
+use crate::{plic, platform, println};
 
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));
 
-// UART0 IRQ number on QEMU virt machine
-const UART0_IRQ: u32 = 10;
-
-// Timer interval: 10 MHz timebase / 10 = 1 second tick
-const TIMER_INTERVAL: u64 = 10_000_000;
+// Platform-aware constants
+const UART0_IRQ: u32 = platform::UART0_IRQ;
+const TIMER_INTERVAL: u64 = platform::TIMER_INTERVAL;
 
 /// Trap frame layout — must match trap.S exactly.
 /// 31 GPRs + sstatus + sepc = 33 fields.
