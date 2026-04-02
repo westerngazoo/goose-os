@@ -1,10 +1,11 @@
 //! GooseOS — A RISC-V operating system written in Rust
 //!
-//! Part 1: Bare-metal boot + Hello World on QEMU virt machine.
+//! Part 2: print!/println! macros + panic handler with UART output.
 
 #![no_std]
 #![no_main]
 
+mod console;
 mod uart;
 
 use core::arch::{asm, global_asm};
@@ -22,26 +23,29 @@ const UART0_BASE: usize = 0x1000_0000;
 /// * `hart_id`  - Hardware thread ID (from OpenSBI via a0)
 /// * `dtb_addr` - Device tree blob address (from OpenSBI via a1)
 #[no_mangle]
-pub extern "C" fn kmain(hart_id: usize, _dtb_addr: usize) -> ! {
+pub extern "C" fn kmain(hart_id: usize, dtb_addr: usize) -> ! {
+    // Initialize UART hardware before any printing
     let uart = uart::Uart::new(UART0_BASE);
     uart.init();
 
-    uart.puts("\n");
-    uart.puts("          __\n");
-    uart.puts("       __( o)>     GooseOS v0.1.0\n");
-    uart.puts("      \\  _/        RISC-V 64-bit\n");
-    uart.puts("       \\\\\\         Written in Rust\n");
-    uart.puts("        \\\\\\__\n");
-    uart.puts("         \\   )>    Honk.\n");
-    uart.puts("      ~~~^~~~~\n");
-    uart.puts("\n");
+    // Now we can use println! everywhere
+    println!();
+    println!("          __");
+    println!("       __( o)>     GooseOS v0.1.0");
+    println!("      \\  _/        RISC-V 64-bit");
+    println!("       \\\\\\         Written in Rust");
+    println!("        \\\\\\__");
+    println!("         \\   )>    Honk.");
+    println!("      ~~~^~~~~");
+    println!();
 
-    // Print which hart we're running on
-    uart.puts("  Booted on hart ");
-    uart.putc(b'0' + hart_id as u8);
-    uart.puts("\n");
-    uart.puts("  Hello from GooseOS!\n");
-    uart.puts("\n");
+    // Formatted output — the whole point of Part 2!
+    println!("  Booted on hart {}", hart_id);
+    println!("  DTB address:   {:#010x}", dtb_addr);
+    println!("  Kernel entry:  {:#010x}", kmain as *const () as usize);
+    println!();
+    println!("  Hello from GooseOS!");
+    println!();
 
     // Halt — nothing else to do yet.
     loop {
@@ -49,10 +53,33 @@ pub extern "C" fn kmain(hart_id: usize, _dtb_addr: usize) -> ! {
     }
 }
 
-/// Panic handler — required by #![no_std].
-/// For now, just halts. Part 2 will print panic info to UART.
+/// Panic handler — prints location and message, then halts.
+///
+/// This is critical for debugging: without it, any bug
+/// (array OOB, unwrap on None, explicit panic) just silently hangs.
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!();
+    println!("!!! KERNEL PANIC !!!");
+
+    if let Some(location) = info.location() {
+        println!(
+            "  at {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        );
+    }
+
+    if let Some(message) = info.message().as_str() {
+        println!("  {}", message);
+    } else {
+        println!("  {}", info.message());
+    }
+
+    println!();
+    println!("System halted.");
+
     loop {
         unsafe { asm!("wfi") };
     }

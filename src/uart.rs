@@ -10,6 +10,7 @@
 ///
 /// All registers are 8-bit (byte-wide) MMIO.
 
+use core::fmt;
 use core::ptr;
 
 pub struct Uart {
@@ -53,5 +54,17 @@ impl Uart {
             }
             self.putc(byte);
         }
+    }
+}
+
+/// Implement core::fmt::Write so we can use write!() and friends.
+///
+/// This is the bridge between Rust's formatting machinery and our
+/// raw UART. Once this exists, we get formatted output for free:
+///   write!(uart, "hart {} at {:#x}", id, addr)
+impl fmt::Write for Uart {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.puts(s);
+        Ok(())
     }
 }
