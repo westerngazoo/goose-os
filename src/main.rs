@@ -67,12 +67,15 @@ pub extern "C" fn kmain(hart_id: usize, dtb_addr: usize) -> ! {
     }
     println!();
 
-    // Idle loop — poll UART for debugging RX on VF2
+    // Idle loop — poll UART (busy-wait for now, debug RX on VF2)
     loop {
         if let Some(c) = uart.getc() {
-            println!("[poll] got byte: 0x{:02x} '{}'", c, c as char);
+            match c {
+                b'\r' | b'\n' => { uart.putc(b'\r'); uart.putc(b'\n'); }
+                0x7F | 0x08 => { uart.putc(0x08); uart.putc(b' '); uart.putc(0x08); }
+                _ => uart.putc(c),
+            }
         }
-        unsafe { asm!("wfi") };
     }
 }
 
