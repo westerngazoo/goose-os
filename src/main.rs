@@ -29,7 +29,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb_addr: usize) -> ! {
 
     println!();
     println!("          __");
-    println!("       __( o)>     GooseOS v0.1.0");
+    println!("       __( o)>     GooseOS v0.1.0 build {}", option_env!("GOOSE_BUILD").unwrap_or("dev"));
     println!("      \\  _/        RISC-V 64-bit");
     println!("       \\\\\\         Written in Rust");
     println!("        \\\\\\        Platform: {}", platform::PLATFORM_NAME);

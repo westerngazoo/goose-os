@@ -5,12 +5,21 @@ QEMU_ARGS := -machine virt -nographic -bios default
 # llvm-objcopy from Rust toolchain (install with: rustup component add llvm-tools)
 OBJCOPY := $(shell find $${HOME}/.rustup -name llvm-objcopy -type f 2>/dev/null | head -1)
 
-.PHONY: build run test debug objdump clean build-vf2 kernel-vf2 flash-sd
+# Auto-incrementing build number
+BUILD_FILE := .build_number
+BUILD_NUM := $(shell cat $(BUILD_FILE) 2>/dev/null || echo 0)
+NEXT_BUILD := $(shell echo $$(($(BUILD_NUM) + 1)))
+
+# VF2 deploy target (IP of VisionFive 2 on local network)
+VF2_IP ?= 192.168.86.237
+
+.PHONY: build run test debug objdump clean build-vf2 kernel-vf2 flash-sd deploy
 
 # ── QEMU (default) ──────────────────────────────────────────
 
 build:
-	cargo build --release
+	GOOSE_BUILD=$(NEXT_BUILD) cargo build --release
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
 
 run: build
 	@echo ">>> Exit QEMU: Ctrl-A then X  (two separate presses)"
@@ -34,14 +43,28 @@ objdump: build
 # ── VisionFive 2 ────────────────────────────────────────────
 
 build-vf2:
-	RUSTFLAGS="-C link-arg=-Tlinker-vf2.ld" \
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	GOOSE_BUILD=$(NEXT_BUILD) RUSTFLAGS="-C link-arg=-Tlinker-vf2.ld" \
 	  cargo build --release --features vf2 --no-default-features
 
 # Extract raw binary for U-Boot (strips ELF headers)
 kernel-vf2: build-vf2
 	$(OBJCOPY) -O binary $(KERNEL_ELF) kernel.bin
 	@ls -lh kernel.bin
-	@echo ">>> kernel.bin ready for VisionFive 2"
+	@echo ">>> kernel.bin ready — build $(NEXT_BUILD)"
+
+# One-command deploy: build, push to git, print instructions
+deploy: kernel-vf2
+	git add kernel.bin src/ Makefile Cargo.toml linker.ld linker-vf2.ld .build_number
+	git commit -m "Build $(NEXT_BUILD)" --allow-empty || true
+	git push
+	@echo ""
+	@echo "========================================="
+	@echo "  DEPLOYED: build $(NEXT_BUILD)"
+	@echo "========================================="
+	@echo "  On VF2 Debian, run:"
+	@echo "    cd /tmp/goose-os && git pull && cp kernel.bin /boot/ && reboot"
+	@echo "========================================="
 
 # Copy kernel.bin to SD card FAT32 partition
 # Usage: make flash-sd SD=/media/sdcard
@@ -52,9 +75,6 @@ endif
 	cp kernel.bin $(SD)/kernel.bin
 	sync
 	@echo ">>> Copied kernel.bin to $(SD)"
-	@echo ">>> In U-Boot, run:"
-	@echo ">>>   fatload mmc 1:1 0x40200000 kernel.bin"
-	@echo ">>>   go 0x40200000"
 
 # ── Common ──────────────────────────────────────────────────
 
