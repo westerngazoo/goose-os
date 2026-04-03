@@ -55,7 +55,7 @@ kernel-vf2: build-vf2
 
 # One-command deploy: build, push to git, print instructions
 deploy: kernel-vf2
-	git add kernel.bin src/ Makefile Cargo.toml linker.ld linker-vf2.ld .build_number
+	git add kernel.bin src/ Makefile Cargo.toml linker.ld linker-vf2.ld .build_number goose-upgrade.sh
 	git commit -m "Build $(NEXT_BUILD)" --allow-empty || true
 	git push
 	@echo ""
@@ -63,7 +63,7 @@ deploy: kernel-vf2
 	@echo "  DEPLOYED: build $(NEXT_BUILD)"
 	@echo "========================================="
 	@echo "  On VF2 Debian, run:"
-	@echo "    cd /tmp/goose-os && git pull && cp kernel.bin /boot/ && reboot"
+	@echo "    goose go"
 	@echo "========================================="
 
 # Copy kernel.bin to SD card FAT32 partition
