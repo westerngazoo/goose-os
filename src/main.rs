@@ -16,6 +16,26 @@ use core::arch::{asm, global_asm};
 // Include the RISC-V assembly boot code.
 global_asm!(include_str!("boot.S"));
 
+/// Call SBI System Reset extension to reboot the machine.
+///
+/// SBI SRST extension:
+///   EID = 0x53525354 ("SRST")
+///   FID = 0
+///   a0  = reset_type  (0=shutdown, 1=cold reboot, 2=warm reboot)
+///   a1  = reset_reason (0=no reason, 1=system failure)
+fn sbi_system_reset() -> ! {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") 1usize,       // reset_type = cold reboot
+            in("a1") 0usize,       // reset_reason = no reason
+            in("a6") 0usize,       // FID = 0
+            in("a7") 0x53525354usize, // EID = SRST
+            options(noreturn)
+        );
+    }
+}
+
 /// Kernel main — called from boot.S after stack setup.
 ///
 /// # Arguments
@@ -61,16 +81,21 @@ pub extern "C" fn kmain(hart_id: usize, dtb_addr: usize) -> ! {
     println!();
     println!("  Interrupts active! Type something...");
     if cfg!(feature = "qemu") {
-        println!("  (timer ticks every 10s, Ctrl-A X to exit QEMU)");
+        println!("  (Ctrl-A X to exit QEMU)");
     } else {
-        println!("  (timer ticks every 10s)");
+        println!("  (Ctrl-R to reboot)");
     }
     println!();
 
-    // Idle loop — poll UART (busy-wait for now, debug RX on VF2)
+    // Idle loop — poll UART for RX, interrupts for timer
     loop {
         if let Some(c) = uart.getc() {
             match c {
+                // Ctrl-R = reboot via SBI
+                0x12 => {
+                    println!("\n  Rebooting...");
+                    sbi_system_reset();
+                }
                 b'\r' | b'\n' => { uart.putc(b'\r'); uart.putc(b'\n'); }
                 0x7F | 0x08 => { uart.putc(0x08); uart.putc(b' '); uart.putc(0x08); }
                 _ => uart.putc(c),
