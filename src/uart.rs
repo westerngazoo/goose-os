@@ -9,6 +9,7 @@
 ///   1  IER      - Interrupt Enable
 ///   2  FCR/IIR  - FIFO Control / Interrupt ID
 ///   3  LCR      - Line Control
+///   4  MCR      - Modem Control
 ///   5  LSR      - Line Status
 
 use core::fmt;
@@ -39,15 +40,18 @@ impl Uart {
         (self.base + index * self.stride) as *mut u8
     }
 
-    /// Initialize UART: 8-bit words, FIFOs enabled, no interrupts.
+    /// Initialize UART: 8-bit words, FIFOs enabled, interrupt output on.
     pub fn init(&self) {
         unsafe {
+            // IER: disable all interrupts during setup
+            ptr::write_volatile(self.reg(1), 0x00);
             // LCR: 8 data bits, 1 stop bit, no parity
             ptr::write_volatile(self.reg(3), 0x03);
-            // FCR: enable FIFOs
-            ptr::write_volatile(self.reg(2), 0x01);
-            // IER: disable all interrupts (for now)
-            ptr::write_volatile(self.reg(1), 0x00);
+            // FCR: enable + clear both FIFOs, 1-byte RX trigger
+            ptr::write_volatile(self.reg(2), 0x07);
+            // MCR: OUT2 (bit 3) — gates interrupt output to PLIC.
+            // Required on real 8250/DW8250 hardware. QEMU ignores it.
+            ptr::write_volatile(self.reg(4), 0x08);
         }
     }
 
