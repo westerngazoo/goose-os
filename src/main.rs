@@ -67,8 +67,11 @@ pub extern "C" fn kmain(hart_id: usize, dtb_addr: usize) -> ! {
     }
     println!();
 
-    // Idle loop — wakes on each interrupt, then sleeps again
+    // Idle loop — poll UART for debugging RX on VF2
     loop {
+        if let Some(c) = uart.getc() {
+            println!("[poll] got byte: 0x{:02x} '{}'", c, c as char);
+        }
         unsafe { asm!("wfi") };
     }
 }

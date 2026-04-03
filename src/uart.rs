@@ -49,9 +49,9 @@ impl Uart {
             ptr::write_volatile(self.reg(3), 0x03);
             // FCR: enable + clear both FIFOs, 1-byte RX trigger
             ptr::write_volatile(self.reg(2), 0x07);
-            // MCR: OUT2 (bit 3) — gates interrupt output to PLIC.
-            // Required on real 8250/DW8250 hardware. QEMU ignores it.
-            ptr::write_volatile(self.reg(4), 0x08);
+            // MCR: OUT2 (bit 3) gates interrupt output to PLIC.
+            // DTR (bit 0) + RTS (bit 1) needed for RX on some hardware.
+            ptr::write_volatile(self.reg(4), 0x0B);
         }
     }
 
