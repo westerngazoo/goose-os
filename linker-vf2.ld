@@ -18,16 +18,22 @@ SECTIONS
 {
     /* Code — _start MUST be first at 0x40200000 */
     .text : {
+        _text_start = .;
         KEEP(*(.text.boot))
         *(.text .text.*)
+        _text_end = .;
     } > RAM
 
     .rodata : ALIGN(4K) {
+        _rodata_start = .;
         *(.rodata .rodata.*)
+        _rodata_end = .;
     } > RAM
 
     .data : ALIGN(4K) {
+        _data_start = .;
         *(.data .data.*)
+        _data_end = .;
     } > RAM
 
     .bss : ALIGN(4K) {
@@ -37,7 +43,16 @@ SECTIONS
         _bss_end = .;
     } > RAM
 
-    _stack_top = ORIGIN(RAM) + LENGTH(RAM);
+    /* End of kernel image — free memory starts here (page-aligned) */
+    . = ALIGN(4K);
+    _end = .;
+
+    /* Kernel stack: 64KB at top of RAM, grows downward.
+     * Page allocator must NOT allocate above _heap_end. */
+    _stack_size = 64K;
+    _memory_end = ORIGIN(RAM) + LENGTH(RAM);
+    _stack_top = _memory_end;
+    _heap_end = _memory_end - _stack_size;
 
     /* Boot hart ID — boot.S compares a0 against this.
      * VisionFive 2: hart 0 is the S7 monitor core (no MMU!).
