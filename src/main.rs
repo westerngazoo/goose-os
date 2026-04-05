@@ -1,6 +1,6 @@
 //! GooseOS — A RISC-V operating system written in Rust
 //!
-//! Part 5: Virtual memory — bitmap page allocator + Sv39 page tables.
+//! Part 6: First userspace process — ecall syscalls, U-mode execution.
 
 // When running `cargo test`, use host std library.
 // When building for RISC-V, use no_std/no_main.
@@ -23,6 +23,8 @@ mod page_alloc;
 mod page_table;
 #[cfg(not(test))]
 mod kvm;
+#[cfg(not(test))]
+mod process;
 
 
 // ── Kernel code (only compiled for RISC-V target, not during host tests) ──
@@ -30,7 +32,7 @@ mod kvm;
 #[cfg(not(test))]
 mod kernel {
     use core::arch::{asm, global_asm};
-    use crate::{page_alloc, kvm, println, platform, trap, plic, uart};
+    use crate::{page_alloc, kvm, process, println, platform, trap, plic, uart};
 
     // Include the RISC-V assembly boot code.
     global_asm!(include_str!("boot.S"));
@@ -107,31 +109,12 @@ mod kernel {
 
         println!("  [page_alloc] {} pages used for page tables, {} free",
             page_alloc.allocated_count(), page_alloc.free_count());
-
-        println!();
-        println!("  Interrupts active! Type something...");
-        if cfg!(feature = "qemu") {
-            println!("  (Ctrl-A X to exit QEMU)");
-        } else {
-            println!("  (Ctrl-R to reboot)");
-        }
         println!();
 
-        // Idle loop — poll UART for RX, interrupts for timer
-        loop {
-            if let Some(c) = uart.getc() {
-                match c {
-                    // Ctrl-R = reboot via SBI
-                    0x12 => {
-                        println!("\n  Rebooting...");
-                        sbi_system_reset();
-                    }
-                    b'\r' | b'\n' => { uart.putc(b'\r'); uart.putc(b'\n'); }
-                    0x7F | 0x08 => { uart.putc(0x08); uart.putc(b' '); uart.putc(0x08); }
-                    _ => uart.putc(c),
-                }
-            }
-        }
+        // === Phase 9: Launch first userspace process ===
+        // This never returns — after the process exits, control goes
+        // to post_process_exit() via the ecall handler.
+        process::launch_init(&mut page_alloc);
     }
 
     /// Panic handler — prints location and message, then halts.

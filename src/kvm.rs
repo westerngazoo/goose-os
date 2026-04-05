@@ -21,6 +21,14 @@ use core::ptr;
 /// Map 4MB to cover priority, pending, enable, and threshold/claim registers.
 const PLIC_MAP_SIZE: usize = 4 * 1024 * 1024; // 4MB = 1024 pages
 
+/// Kernel's satp value — stored after MMU enable so processes can switch back.
+static mut KERNEL_SATP: u64 = 0;
+
+/// Get the kernel's satp value (for switching back from user page tables).
+pub fn kernel_satp() -> u64 {
+    unsafe { KERNEL_SATP }
+}
+
 /// Build the kernel identity-mapped page table.
 ///
 /// Returns the physical address of the root page table (for satp).
@@ -102,6 +110,9 @@ pub fn init(alloc: &mut BitmapAllocator) -> usize {
 pub unsafe fn enable_mmu(root_phys: usize) {
     let satp_val = make_satp(root_phys, 0);
 
+    // Store for later (process.rs needs this to switch back)
+    KERNEL_SATP = satp_val;
+
     crate::println!("  [kvm] Enabling Sv39 MMU (satp = {:#018x})...", satp_val);
 
     core::arch::asm!(
@@ -125,7 +136,7 @@ pub unsafe fn enable_mmu(root_phys: usize) {
 ///
 /// For each page, we walk/create the 3-level table:
 ///   root[vpn2] → level1[vpn1] → level0[vpn0] = leaf PTE
-fn map_range(
+pub(crate) fn map_range(
     root_phys: usize,
     start: usize,
     end: usize,
@@ -146,7 +157,7 @@ fn map_range(
 /// Map a single virtual page to a physical page in the 3-level Sv39 table.
 ///
 /// Walks root → level1 → level0, allocating intermediate tables as needed.
-fn map_page(
+pub(crate) fn map_page(
     root_phys: usize,
     va: usize,
     pa: usize,
@@ -168,7 +179,7 @@ fn map_page(
 
 /// Read PTE at `table_phys + index * 8`. If it's a valid branch, return the
 /// child table address. If invalid, allocate a new table and install a branch PTE.
-fn walk_or_create(table_phys: usize, index: usize, alloc: &mut BitmapAllocator) -> usize {
+pub(crate) fn walk_or_create(table_phys: usize, index: usize, alloc: &mut BitmapAllocator) -> usize {
     let existing = read_pte(table_phys, index);
 
     if existing.is_valid() {
@@ -201,10 +212,36 @@ fn write_pte(table_phys: usize, index: usize, pte: Pte) {
 }
 
 /// Allocate a zeroed page from the allocator.
-fn alloc_zeroed_page(alloc: &mut BitmapAllocator) -> usize {
+pub(crate) fn alloc_zeroed_page(alloc: &mut BitmapAllocator) -> usize {
     let page = alloc.alloc().expect("kvm: out of memory for page tables");
     unsafe { BitmapAllocator::zero_page(page); }
     page
+}
+
+/// Map all kernel regions into an arbitrary root page table.
+///
+/// Used by process.rs to build user page tables that include kernel mappings.
+/// The kernel regions are mapped WITHOUT the U bit, so user code can't access
+/// them — but the kernel trap handler CAN, even when satp points to this table.
+pub fn map_kernel_regions(root_phys: usize, alloc: &mut BitmapAllocator) {
+    let (text_start, text_end) = linker_range("_text_start", "_text_end");
+    let (rodata_start, rodata_end) = linker_range("_rodata_start", "_rodata_end");
+    let (data_start, data_end) = linker_range("_data_start", "_data_end");
+    let (bss_start, bss_end) = linker_range("_bss_start", "_bss_end");
+    let heap_start = linker_symbol("_end");
+    let stack_top = linker_symbol("_stack_top");
+
+    map_range(root_phys, text_start, text_end, KERNEL_RX, alloc);
+    map_range(root_phys, rodata_start, rodata_end, KERNEL_RO, alloc);
+    map_range(root_phys, data_start, data_end, KERNEL_RW, alloc);
+    map_range(root_phys, bss_start, bss_end, KERNEL_RW, alloc);
+    map_range(root_phys, heap_start, stack_top, KERNEL_RW, alloc);
+
+    // MMIO
+    let uart_base = platform::UART_BASE;
+    map_range(root_phys, uart_base, uart_base + PAGE_SIZE, KERNEL_MMIO, alloc);
+    let plic_base = platform::PLIC_BASE;
+    map_range(root_phys, plic_base, plic_base + PLIC_MAP_SIZE, KERNEL_MMIO, alloc);
 }
 
 // ── Linker symbol accessors ─────────────────────────────────────

@@ -11,6 +11,10 @@
 use core::arch::{asm, global_asm};
 use crate::{plic, platform, println};
 
+/// Syscall numbers — must match userspace programs.
+pub const SYS_PUTCHAR: usize = 0;
+pub const SYS_EXIT: usize = 1;
+
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));
 
@@ -119,29 +123,131 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
             }
         }
     } else {
-        // Exception — print diagnostics and panic
-        let cause_name = match code {
-            0 => "instruction address misaligned",
-            1 => "instruction access fault",
-            2 => "illegal instruction",
-            3 => "breakpoint",
-            4 => "load address misaligned",
-            5 => "load access fault",
-            6 => "store address misaligned",
-            7 => "store/AMO access fault",
-            8 => "environment call from U-mode",
-            9 => "environment call from S-mode",
-            12 => "instruction page fault",
-            13 => "load page fault",
-            15 => "store/AMO page fault",
-            _ => "unknown",
-        };
-        println!("\n!!! EXCEPTION !!!");
-        println!("  cause:  {} (code={})", cause_name, code);
-        println!("  stval:  {:#018x}", stval);
-        println!("  sepc:   {:#018x}", frame.sepc);
-        println!("  ra:     {:#018x}", frame.ra);
-        panic!("unrecoverable exception");
+        // Exception
+        match code {
+            8 => {
+                // ecall from U-mode — handle syscall
+                handle_ecall(frame);
+            }
+            _ => {
+                // Unexpected exception — print diagnostics and panic
+                let cause_name = match code {
+                    0 => "instruction address misaligned",
+                    1 => "instruction access fault",
+                    2 => "illegal instruction",
+                    3 => "breakpoint",
+                    4 => "load address misaligned",
+                    5 => "load access fault",
+                    6 => "store address misaligned",
+                    7 => "store/AMO access fault",
+                    9 => "environment call from S-mode",
+                    12 => "instruction page fault",
+                    13 => "load page fault",
+                    15 => "store/AMO page fault",
+                    _ => "unknown",
+                };
+                println!("\n!!! EXCEPTION !!!");
+                println!("  cause:  {} (code={})", cause_name, code);
+                println!("  stval:  {:#018x}", stval);
+                println!("  sepc:   {:#018x}", frame.sepc);
+                println!("  ra:     {:#018x}", frame.ra);
+                panic!("unrecoverable exception");
+            }
+        }
+    }
+}
+
+/// Handle ecall from U-mode — syscall dispatch.
+///
+/// Convention:
+///   a7 = syscall number
+///   a0 = first argument (and return value)
+///   sepc is advanced by 4 so sret goes to the instruction after ecall.
+fn handle_ecall(frame: &mut TrapFrame) {
+    let syscall_num = frame.a7;
+
+    match syscall_num {
+        SYS_PUTCHAR => {
+            // Write one character to UART
+            let ch = frame.a0 as u8;
+            crate::uart::Uart::platform().putc(ch);
+            frame.a0 = 0; // success
+        }
+        SYS_EXIT => {
+            let exit_code = frame.a0;
+            println!();
+            println!("  [kernel] Process exited with code {}", exit_code);
+
+            // Switch back to kernel page table
+            let kernel_satp = crate::kvm::kernel_satp();
+            unsafe {
+                asm!(
+                    "csrw satp, {0}",
+                    "sfence.vma zero, zero",
+                    in(reg) kernel_satp,
+                );
+            }
+
+            // Modify the trap frame so sret returns to S-mode
+            // at our post_process_exit function instead of user code.
+            // Set SPP = 1 (S-mode) in sstatus
+            frame.sstatus |= 1 << 8;
+            // Also re-enable interrupts on sret (SPIE = 1, bit 5)
+            frame.sstatus |= 1 << 5;
+            // Return to the kernel's post-exit idle loop
+            frame.sepc = post_process_exit as *const () as usize;
+
+            // sepc already points to the right place; don't advance by 4
+            return;
+        }
+        _ => {
+            println!("\n  [kernel] Unknown syscall: {} (a0={:#x})", syscall_num, frame.a0);
+            frame.a0 = usize::MAX; // error
+        }
+    }
+
+    // Advance past the ecall instruction (4 bytes)
+    frame.sepc += 4;
+}
+
+/// Kernel re-entry point after a user process exits.
+///
+/// We land here via sret after SYS_EXIT rewrites the trap frame.
+/// Runs in S-mode with kernel satp. Enters the idle loop.
+#[no_mangle]
+pub extern "C" fn post_process_exit() -> ! {
+    println!("  [kernel] Back in S-mode. Idle loop active.");
+    println!();
+    if cfg!(feature = "qemu") {
+        println!("  (Ctrl-A X to exit QEMU)");
+    } else {
+        println!("  (Ctrl-R to reboot)");
+    }
+    println!();
+
+    let uart = crate::uart::Uart::platform();
+    loop {
+        if let Some(c) = uart.getc() {
+            match c {
+                0x12 => {
+                    println!("\n  Rebooting...");
+                    // SBI System Reset
+                    unsafe {
+                        asm!(
+                            "ecall",
+                            in("a0") 1usize,
+                            in("a1") 0usize,
+                            in("a6") 0usize,
+                            in("a7") 0x53525354usize,
+                            options(noreturn)
+                        );
+                    }
+                }
+                b'\r' | b'\n' => { uart.putc(b'\r'); uart.putc(b'\n'); }
+                0x7F | 0x08 => { uart.putc(0x08); uart.putc(b' '); uart.putc(0x08); }
+                _ => uart.putc(c),
+            }
+        }
     }
 }
 
