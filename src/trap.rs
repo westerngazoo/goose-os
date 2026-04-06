@@ -231,7 +231,7 @@ pub extern "C" fn post_process_exit() -> ! {
     if cfg!(feature = "qemu") {
         println!("  (Ctrl-A X to exit QEMU)");
     } else {
-        println!("  (Type R to reboot)");
+        println!("  (Ctrl-R or R to reboot)");
     }
     println!();
     loop {
@@ -253,14 +253,7 @@ pub extern "C" fn post_process_exit() -> ! {
                 }
                 b'\r' | b'\n' => { uart.putc(b'\r'); uart.putc(b'\n'); }
                 0x7F | 0x08 => { uart.putc(0x08); uart.putc(b' '); uart.putc(0x08); }
-                _ => {
-                    // Debug: show hex value of non-printable characters
-                    if c < 0x20 {
-                        println!("[key: 0x{:02x}]", c);
-                    } else {
-                        uart.putc(c);
-                    }
-                }
+                _ => uart.putc(c),
             }
         }
     }
