@@ -1,6 +1,6 @@
-/// Process management — process table, IPC, context switching, memory syscalls.
+/// Process management — process table, IPC, context switching, memory, lifecycle.
 ///
-/// Phase 10: Memory Management (alloc, map, unmap, free).
+/// Phase 11: Process Lifecycle (spawn, wait, getpid).
 ///
 /// Design:
 ///   - Fixed-size process table (no dynamic allocation in kernel)
@@ -38,6 +38,7 @@ pub enum ProcessState {
     BlockedSend,    // Waiting for receiver to call RECEIVE
     BlockedRecv,    // Waiting for sender to call SEND
     BlockedCall,    // Sent via SYS_CALL, waiting for SYS_REPLY
+    BlockedWait,    // Waiting for child process to exit (SYS_WAIT)
 }
 
 // ── Process Control Block ──────────────────────────────────────
@@ -51,6 +52,9 @@ pub struct Process {
     // IPC state
     pub ipc_target: usize,      // Who we're sending to / expecting from (0 = any)
     pub ipc_value: usize,       // Message being sent
+    // Lifecycle
+    pub parent: usize,          // Parent PID (0 = kernel-spawned)
+    pub exit_code: usize,       // Stored when process exits
 }
 
 impl Process {
@@ -62,6 +66,8 @@ impl Process {
             context: TrapFrame::zero(),
             ipc_target: 0,
             ipc_value: 0,
+            parent: 0,
+            exit_code: 0,
         }
     }
 }
@@ -75,12 +81,76 @@ static mut PROCS: [Process; MAX_PROCS] = [Process::empty(); MAX_PROCS];
 /// PID of the currently running process.
 static mut CURRENT_PID: usize = 0;
 
+// ── Child ELF Binary (hand-crafted) ───────────────────────────
+
+/// Hand-crafted minimal RISC-V 64-bit ELF binary.
+///
+/// This child program prints "Hi!\n" via SYS_PUTCHAR and exits with code 42.
+/// Used by init to test SYS_SPAWN + SYS_WAIT.
+///
+/// Layout:
+///   0x00-0x3F  ELF64 Header (64 bytes)
+///   0x40-0x77  Program Header: 1 PT_LOAD segment (56 bytes)
+///   0x78-0xB3  Code: 15 RISC-V instructions (60 bytes)
+///   Total: 180 bytes
+///
+/// Load address: VA 0x10000
+/// Entry point:  VA 0x10078
+const CHILD_ELF: [u8; 180] = [
+    // ── ELF Header (64 bytes) ────────────────────────────
+    0x7F, 0x45, 0x4C, 0x46,                             // e_ident[0..3]: magic
+    0x02,                                                // e_ident[4]: ELFCLASS64
+    0x01,                                                // e_ident[5]: ELFDATA2LSB
+    0x01,                                                // e_ident[6]: EV_CURRENT
+    0x00,                                                // e_ident[7]: ELFOSABI_NONE
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,     // e_ident[8..15]: padding
+    0x02, 0x00,                                          // e_type: ET_EXEC
+    0xF3, 0x00,                                          // e_machine: EM_RISCV
+    0x01, 0x00, 0x00, 0x00,                              // e_version
+    0x78, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,     // e_entry: 0x10078
+    0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,     // e_phoff: 64
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,     // e_shoff: 0
+    0x00, 0x00, 0x00, 0x00,                              // e_flags
+    0x40, 0x00,                                          // e_ehsize: 64
+    0x38, 0x00,                                          // e_phentsize: 56
+    0x01, 0x00,                                          // e_phnum: 1
+    0x00, 0x00,                                          // e_shentsize
+    0x00, 0x00,                                          // e_shnum
+    0x00, 0x00,                                          // e_shstrndx
+    // ── Program Header (56 bytes) ────────────────────────
+    0x01, 0x00, 0x00, 0x00,                              // p_type: PT_LOAD
+    0x05, 0x00, 0x00, 0x00,                              // p_flags: PF_R | PF_X
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,     // p_offset: 0
+    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,     // p_vaddr: 0x10000
+    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,     // p_paddr: 0x10000
+    0xB4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,     // p_filesz: 180
+    0xB4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,     // p_memsz: 180
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,     // p_align: 0x1000
+    // ── Code (60 bytes) ──────────────────────────────────
+    // Prints "Hi!\n" via SYS_PUTCHAR, then SYS_EXIT(42).
+    0x93, 0x08, 0x00, 0x00,  // addi a7, zero, 0   (SYS_PUTCHAR)
+    0x13, 0x05, 0x80, 0x04,  // addi a0, zero, 'H' (0x48)
+    0x73, 0x00, 0x00, 0x00,  // ecall
+    0x93, 0x08, 0x00, 0x00,  // addi a7, zero, 0   (SYS_PUTCHAR)
+    0x13, 0x05, 0x90, 0x06,  // addi a0, zero, 'i' (0x69)
+    0x73, 0x00, 0x00, 0x00,  // ecall
+    0x93, 0x08, 0x00, 0x00,  // addi a7, zero, 0   (SYS_PUTCHAR)
+    0x13, 0x05, 0x10, 0x02,  // addi a0, zero, '!' (0x21)
+    0x73, 0x00, 0x00, 0x00,  // ecall
+    0x93, 0x08, 0x00, 0x00,  // addi a7, zero, 0   (SYS_PUTCHAR)
+    0x13, 0x05, 0xA0, 0x00,  // addi a0, zero, '\n'(0x0A)
+    0x73, 0x00, 0x00, 0x00,  // ecall
+    0x93, 0x08, 0x10, 0x00,  // addi a7, zero, 1   (SYS_EXIT)
+    0x13, 0x05, 0xA0, 0x02,  // addi a0, zero, 42  (exit code)
+    0x73, 0x00, 0x00, 0x00,  // ecall
+];
+
 // ── Embedded User Programs ─────────────────────────────────────
 
-// Program 1: init (PID 1) — Memory test + RPC client
-// Phase 10: Allocates a page, maps it, writes/reads a test byte,
-// then reports the result via SYS_CALL to the server.
-// Demonstrates: SYS_ALLOC_PAGES → SYS_MAP → write → read → SYS_CALL → SYS_UNMAP → SYS_FREE_PAGES
+// Program 1: init (PID 1) — Process lifecycle test
+// Phase 11: Gets PID, spawns a child from ELF, waits for it,
+// reports result via RPC, tells server to quit, exits.
+// Demonstrates: SYS_GETPID → SYS_SPAWN → SYS_WAIT → SYS_CALL → SYS_EXIT
 global_asm!(r#"
 .section .text
 .balign 4
@@ -89,58 +159,44 @@ global_asm!(r#"
 
 _user_init_start:
     # ─── GooseOS init process (PID 1) ───
-    # Phase 10: Memory management test + RPC output.
+    # Phase 11: Process lifecycle demo.
     #
     # Registers:
     #   s0 = server PID (2)
-    #   s1 = allocated physical address
-    #   s2 = virtual address for mapping (0x60000000)
+    #   s1 = our PID (from SYS_GETPID)
+    #   s2 = child PID (from SYS_SPAWN)
+    #   s3 = child exit code (from SYS_WAIT)
+    #   s4 = ELF data address (mapped by kernel at boot)
+    #   s5 = ELF data length
 
     li      s0, 2               # server PID
-    li      s2, 0x60000000      # target VA for mapped page
+    li      s4, 0x5F000000      # child ELF mapped here by kernel
+    li      s5, 180             # child ELF size (bytes)
 
-    # ── Step 1: Allocate a physical page ──
-    li      a7, 8               # SYS_ALLOC_PAGES
-    li      a0, 1               # count = 1
+    # ── Step 1: SYS_GETPID — verify we are PID 1 ──
+    li      a7, 12              # SYS_GETPID
     ecall
-    # a0 = physical address (or -1 on error)
-    li      t0, -1
-    beq     a0, t0, .fail
-    mv      s1, a0              # save phys addr
+    mv      s1, a0              # save PID (should be 1)
 
-    # ── Step 2: Map it at VA 0x60000000 (USER_RW) ──
-    li      a7, 6               # SYS_MAP
-    mv      a0, s1              # physical address
-    mv      a1, s2              # virtual address
-    li      a2, 0               # flags = 0 (USER_RW)
+    # ── Step 2: SYS_SPAWN — create child from ELF ──
+    li      a7, 10              # SYS_SPAWN
+    mv      a0, s4              # elf_ptr
+    mv      a1, s5              # elf_len
     ecall
     li      t0, -1
-    beq     a0, t0, .fail
+    beq     a0, t0, .fail       # spawn failed?
+    mv      s2, a0              # save child PID (should be 3)
 
-    # ── Step 3: Write test byte to mapped page ──
-    li      t0, 0x42            # 'B' (test value)
-    sb      t0, 0(s2)           # store at VA 0x60000000
+    # ── Step 3: SYS_WAIT — wait for child to exit ──
+    li      a7, 11              # SYS_WAIT
+    mv      a0, s2              # child PID
+    ecall
+    mv      s3, a0              # save exit code (should be 42)
 
-    # ── Step 4: Read it back and verify ──
-    lbu     t1, 0(s2)           # load unsigned byte
-    bne     t0, t1, .fail       # if mismatch → fail
-
-    # ── Step 5: Success! Report via RPC: "Pg ok!\n" ──
+    # ── Step 4: Report "Ok!\n" via RPC to server ──
     li a7, 4
     mv a0, s0
-    li a1, 0x50                 # 'P'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x67                 # 'g'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x20                 # ' '
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x6F                 # 'o'
+    li a1, 0x4F                 # 'O'
     ecall
     li a7, 4
     mv a0, s0
@@ -155,17 +211,13 @@ _user_init_start:
     li a1, 0x0A                 # '\n'
     ecall
 
-    # ── Step 6: Cleanup — unmap + free ──
-    li      a7, 7               # SYS_UNMAP
-    mv      a0, s2              # virtual address
+    # ── Step 5: Tell server to quit ──
+    li      a7, 4               # SYS_CALL
+    mv      a0, s0              # server PID
+    li      a1, 0xFF            # quit signal
     ecall
 
-    li      a7, 9               # SYS_FREE_PAGES
-    mv      a0, s1              # physical address
-    li      a1, 1               # count = 1
-    ecall
-
-    # Exit success
+    # ── Step 6: Exit ──
     li      a7, 1               # SYS_EXIT
     li      a0, 0               # code 0
     ecall
@@ -173,7 +225,7 @@ _user_init_start:
 1:  j       1b
 
 .fail:
-    # Memory test failed — exit with code 1
+    # Spawn failed — exit with code 1
     li      a7, 1               # SYS_EXIT
     li      a0, 1               # code 1 (failure)
     ecall
@@ -184,8 +236,8 @@ _user_init_end:
 "#);
 
 // Program 2: UART server (PID 2) — RPC server
-// Infinite loop: RECEIVE a call, print character via PUTCHAR, REPLY to caller.
-// This is the server side of the SYS_CALL/SYS_REPLY RPC pattern.
+// Receives messages, prints via PUTCHAR, replies with ACK.
+// Quit signal (0xFF) causes clean exit.
 global_asm!(r#"
 .section .text
 .balign 4
@@ -195,91 +247,45 @@ global_asm!(r#"
 _user_srv_start:
     # ─── GooseOS UART server (PID 2) ───
     # RPC server: receives messages, prints them, replies with ACK.
-    # SYS_RECEIVE: a7=3, a0=from_pid (0=any)
-    # Returns: a0=message value, a1=sender PID
-    # SYS_REPLY: a7=5, a0=caller PID, a1=reply value
+    # Quit signal: 0xFF → reply + exit cleanly.
 1:
     li      a7, 3           # SYS_RECEIVE
     li      a0, 0           # from any sender
     ecall
-    # a0 = character, a1 = sender PID
+    # a0 = message value, a1 = sender PID
 
-    mv      s0, a0          # save character
-    mv      s1, a1          # save sender PID (need it for REPLY)
+    mv      s0, a0          # save message
+    mv      s1, a1          # save sender PID
+
+    # Check for quit signal
+    li      t0, 0xFF
+    beq     s0, t0, .quit
 
     li      a7, 0           # SYS_PUTCHAR
     mv      a0, s0          # the character
     ecall
 
     li      a7, 5           # SYS_REPLY
-    mv      a0, s1          # reply to the caller
-    li      a1, 0           # reply value = 0 (ACK)
+    mv      a0, s1          # reply to caller
+    li      a1, 0           # ACK
     ecall
 
-    j       1b              # loop forever
+    j       1b              # loop
+
+.quit:
+    li      a7, 5           # SYS_REPLY (reply before exiting)
+    mv      a0, s1
+    li      a1, 0           # ACK
+    ecall
+
+    li      a7, 1           # SYS_EXIT
+    li      a0, 0           # success
+    ecall
+
+2:  j       2b
 
 _user_srv_end:
 "#);
-
-// ── Process Creation ───────────────────────────────────────────
-
-/// Create a new process from an embedded program.
-///
-/// Allocates:
-///   - 1 page for user code (copied from kernel .text)
-///   - 1 page for user stack
-///   - N pages for user page table (kernel regions + user pages)
-///
-/// Sets up initial context so first context-switch srets to user entry.
-fn create_process(
-    pid: usize,
-    code_start: usize,
-    code_size: usize,
-) {
-    assert!(pid > 0 && pid < MAX_PROCS, "invalid PID");
-
-    // Allocate user code page and copy program
-    let user_code = kvm::alloc_zeroed_page();
-    unsafe {
-        let src = code_start as *const u8;
-        let dst = user_code as *mut u8;
-        for i in 0..code_size {
-            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
-        }
-    }
-
-    // Allocate user stack (one page, sp starts at top)
-    let user_stack = kvm::alloc_zeroed_page();
-    let user_sp = user_stack + PAGE_SIZE;
-
-    // Build user page table
-    let user_root = kvm::alloc_zeroed_page();
-    kvm::map_kernel_regions(user_root);
-    kvm::map_range(user_root, user_code, user_code + PAGE_SIZE, USER_RX);
-    kvm::map_range(user_root, user_stack, user_stack + PAGE_SIZE, USER_RW);
-
-    let satp = make_satp(user_root, pid as u16);
-
-    // Initial context: U-mode, interrupts enabled, entry at code page
-    let mut ctx = TrapFrame::zero();
-    ctx.sepc = user_code;       // entry point
-    ctx.sp = user_sp;           // user stack top
-    ctx.sstatus = 1 << 5;       // SPIE=1 (enable interrupts on sret), SPP=0 (U-mode)
-
-    unsafe {
-        PROCS[pid] = Process {
-            pid,
-            state: ProcessState::Ready,
-            satp,
-            context: ctx,
-            ipc_target: 0,
-            ipc_value: 0,
-        };
-    }
-
-    println!("  [proc] PID {} created (code={:#x}, {}) bytes, sp={:#x}, satp={:#018x})",
-        pid, user_code, code_size, user_sp, satp);
-}
 
 // ── Boot: Create Processes and Launch ──────────────────────────
 
@@ -305,6 +311,21 @@ pub fn launch() -> ! {
 
     create_process(1, init_start, init_size);
     create_process(2, srv_start, srv_size);
+
+    // Map the child ELF binary into PID 1's address space at VA 0x5F00_0000.
+    // This is a primitive "initfs" — init can SYS_SPAWN the child from this address.
+    let elf_page = kvm::alloc_zeroed_page();
+    unsafe {
+        let src = CHILD_ELF.as_ptr();
+        let dst = elf_page as *mut u8;
+        for i in 0..CHILD_ELF.len() {
+            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+        }
+    }
+    let root1 = kvm::satp_to_root(unsafe { PROCS[1].satp });
+    kvm::map_user_page(root1, 0x5F00_0000, elf_page, USER_RW);
+    println!("  [proc] Mapped child ELF ({} bytes) at VA {:#x} for PID 1",
+        CHILD_ELF.len(), 0x5F00_0000usize);
 
     let alloc = unsafe { crate::page_alloc::get() };
     println!();
@@ -601,6 +622,192 @@ pub fn sys_free_pages(frame: &mut TrapFrame) {
     }
 }
 
+// ── Process Spawn ─────────────────────────────────────────────
+
+/// SYS_SPAWN(elf_ptr, elf_len) — create a new process from an ELF binary.
+///
+/// Convention: a0 = pointer to ELF data (in caller's memory), a1 = length.
+/// Returns: a0 = new PID, usize::MAX on error.
+///
+/// Parses the ELF, allocates pages for each LOAD segment, copies data,
+/// builds a user page table, and registers the process as Ready.
+pub fn sys_spawn(frame: &mut TrapFrame) {
+    frame.sepc += 4;
+
+    let elf_ptr = frame.a0;
+    let elf_len = frame.a1;
+    let parent = unsafe { CURRENT_PID };
+
+    // Basic validation
+    if elf_len == 0 || elf_len > 1024 * 1024 {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    // Enable Supervisor User Memory access (SUM bit in sstatus).
+    // Without this, S-mode cannot read pages with the U bit set.
+    // trap.S will restore the original sstatus before sret, so
+    // this only affects the current trap handling.
+    unsafe { asm!("csrs sstatus, {}", in(reg) 1usize << 18); }
+
+    // Read the ELF data from caller's address space
+    let elf_data = unsafe {
+        core::slice::from_raw_parts(elf_ptr as *const u8, elf_len)
+    };
+
+    // Parse ELF headers
+    let info = match crate::elf::parse(elf_data) {
+        Ok(info) => info,
+        Err(_) => {
+            frame.a0 = usize::MAX;
+            return;
+        }
+    };
+
+    // Find a free process slot
+    let mut new_pid = 0;
+    unsafe {
+        for i in 1..MAX_PROCS {
+            if PROCS[i].state == ProcessState::Free {
+                new_pid = i;
+                break;
+            }
+        }
+    }
+    if new_pid == 0 {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    // Build user page table
+    let user_root = kvm::alloc_zeroed_page();
+    kvm::map_kernel_regions(user_root);
+
+    // Load each segment
+    for seg_idx in 0..info.num_segments {
+        let seg = &info.segments[seg_idx];
+        let flags = if seg.executable { USER_RX } else { USER_RW };
+
+        let num_pages = crate::elf::pages_needed(seg.memsz, seg.vaddr);
+        let base_va = seg.vaddr & !(PAGE_SIZE - 1);
+
+        for p in 0..num_pages {
+            let va = base_va + p * PAGE_SIZE;
+            let page = kvm::alloc_zeroed_page();
+
+            // Calculate how much of this page needs file data
+            let page_start = va;
+            let page_end = va + PAGE_SIZE;
+
+            let seg_file_start = seg.vaddr;
+            let seg_file_end = seg.vaddr + seg.filesz;
+
+            // Overlap between [page_start..page_end] and [seg_file_start..seg_file_end]
+            let copy_start = if seg_file_start > page_start { seg_file_start } else { page_start };
+            let copy_end = if seg_file_end < page_end { seg_file_end } else { page_end };
+
+            if copy_start < copy_end {
+                let file_offset = seg.file_offset + (copy_start - seg.vaddr);
+                let dst_offset = copy_start - page_start;
+                let len = copy_end - copy_start;
+
+                unsafe {
+                    let src = elf_data.as_ptr().add(file_offset);
+                    let dst = (page as *mut u8).add(dst_offset);
+                    for b in 0..len {
+                        core::ptr::write_volatile(dst.add(b), core::ptr::read_volatile(src.add(b)));
+                    }
+                }
+            }
+            // memsz > filesz portion is already zeroed (alloc_zeroed_page)
+
+            kvm::map_user_page(user_root, va, page, flags);
+        }
+    }
+
+    // Allocate user stack (one page)
+    let user_stack = kvm::alloc_zeroed_page();
+    let stack_va = 0x7FFF_0000; // Fixed stack VA for spawned processes
+    kvm::map_user_page(user_root, stack_va, user_stack, USER_RW);
+    let user_sp = stack_va + PAGE_SIZE;
+
+    let satp = make_satp(user_root, new_pid as u16);
+
+    // Set up initial context
+    let mut ctx = TrapFrame::zero();
+    ctx.sepc = info.entry;
+    ctx.sp = user_sp;
+    ctx.sstatus = 1 << 5; // SPIE=1, SPP=0 (U-mode)
+
+    unsafe {
+        PROCS[new_pid] = Process {
+            pid: new_pid,
+            state: ProcessState::Ready,
+            satp,
+            context: ctx,
+            ipc_target: 0,
+            ipc_value: 0,
+            parent,
+            exit_code: 0,
+        };
+    }
+
+    println!("  [kernel] PID {} spawned by PID {} (entry={:#x})",
+        new_pid, parent, info.entry);
+
+    frame.a0 = new_pid;
+}
+
+/// Kernel-level spawn for boot processes (not via syscall).
+/// Used by launch() to create initial processes from embedded assembly.
+fn create_process(
+    pid: usize,
+    code_start: usize,
+    code_size: usize,
+) {
+    assert!(pid > 0 && pid < MAX_PROCS, "invalid PID");
+
+    let user_code = kvm::alloc_zeroed_page();
+    unsafe {
+        let src = code_start as *const u8;
+        let dst = user_code as *mut u8;
+        for i in 0..code_size {
+            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+        }
+    }
+
+    let user_stack = kvm::alloc_zeroed_page();
+    let user_sp = user_stack + PAGE_SIZE;
+
+    let user_root = kvm::alloc_zeroed_page();
+    kvm::map_kernel_regions(user_root);
+    kvm::map_range(user_root, user_code, user_code + PAGE_SIZE, USER_RX);
+    kvm::map_range(user_root, user_stack, user_stack + PAGE_SIZE, USER_RW);
+
+    let satp = make_satp(user_root, pid as u16);
+
+    let mut ctx = TrapFrame::zero();
+    ctx.sepc = user_code;
+    ctx.sp = user_sp;
+    ctx.sstatus = 1 << 5;
+
+    unsafe {
+        PROCS[pid] = Process {
+            pid,
+            state: ProcessState::Ready,
+            satp,
+            context: ctx,
+            ipc_target: 0,
+            ipc_value: 0,
+            parent: 0,
+            exit_code: 0,
+        };
+    }
+
+    println!("  [proc] PID {} created (code={:#x}, {} bytes, sp={:#x}, satp={:#018x})",
+        pid, user_code, code_size, user_sp, satp);
+}
+
 // ── IPC Syscall Handlers ──────────────────────────────────────
 
 /// SYS_SEND(target_pid, msg_value) — synchronous send.
@@ -721,6 +928,19 @@ pub fn sys_exit(frame: &mut TrapFrame) {
 
     unsafe {
         PROCS[current].state = ProcessState::Free;
+        PROCS[current].exit_code = exit_code;
+
+        // Wake any parent that's BlockedWait on us
+        for i in 1..MAX_PROCS {
+            if PROCS[i].state == ProcessState::BlockedWait
+                && PROCS[i].ipc_target == current
+            {
+                // Deliver exit code to parent's saved context
+                PROCS[i].context.a0 = exit_code;
+                PROCS[i].state = ProcessState::Ready;
+                break; // only one parent
+            }
+        }
 
         // Find next ready process
         let mut next = 0;
@@ -760,6 +980,56 @@ pub fn sys_exit(frame: &mut TrapFrame) {
             "sfence.vma zero, zero",
             in(reg) next_satp,
         );
+    }
+}
+
+// ── Lifecycle Syscall Handlers ────────────────────────────────
+
+/// SYS_GETPID() — return the current process's PID.
+///
+/// Convention: no arguments. Returns: a0 = PID.
+pub fn sys_getpid(frame: &mut TrapFrame) {
+    frame.sepc += 4;
+    frame.a0 = unsafe { CURRENT_PID };
+}
+
+/// SYS_WAIT(child_pid) — block until a child process exits.
+///
+/// Convention: a0 = child PID.
+/// Returns: a0 = child's exit code, usize::MAX on error.
+///
+/// If the child has already exited (Free state), returns immediately
+/// with the stored exit code. Otherwise blocks until the child calls SYS_EXIT.
+pub fn sys_wait(frame: &mut TrapFrame) {
+    frame.sepc += 4;
+
+    let current = unsafe { CURRENT_PID };
+    let child_pid = frame.a0;
+
+    // Validate
+    if child_pid == 0 || child_pid >= MAX_PROCS || child_pid == current {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    unsafe {
+        // Check if the child exists and belongs to us
+        if PROCS[child_pid].parent != current {
+            frame.a0 = usize::MAX;
+            return;
+        }
+
+        // Already exited? Return immediately.
+        if PROCS[child_pid].state == ProcessState::Free {
+            frame.a0 = PROCS[child_pid].exit_code;
+            return;
+        }
+
+        // Child still running — block
+        PROCS[current].ipc_target = child_pid; // who we're waiting for
+        PROCS[current].state = ProcessState::BlockedWait;
+
+        schedule(frame, current);
     }
 }
 

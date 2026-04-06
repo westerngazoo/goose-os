@@ -22,6 +22,9 @@ pub const SYS_MAP: usize = 6;
 pub const SYS_UNMAP: usize = 7;
 pub const SYS_ALLOC_PAGES: usize = 8;
 pub const SYS_FREE_PAGES: usize = 9;
+pub const SYS_SPAWN: usize = 10;
+pub const SYS_WAIT: usize = 11;
+pub const SYS_GETPID: usize = 12;
 
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));
@@ -235,6 +238,18 @@ fn handle_ecall(frame: &mut TrapFrame) {
         }
         SYS_FREE_PAGES => {
             crate::process::sys_free_pages(frame);
+            return;
+        }
+        SYS_SPAWN => {
+            crate::process::sys_spawn(frame);
+            return;
+        }
+        SYS_WAIT => {
+            crate::process::sys_wait(frame);
+            return;
+        }
+        SYS_GETPID => {
+            crate::process::sys_getpid(frame);
             return;
         }
         _ => {

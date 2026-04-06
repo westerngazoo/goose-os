@@ -1,6 +1,6 @@
 //! GooseOS — A RISC-V operating system written in Rust
 //!
-//! Phase 10: Memory Management — userspace page allocation and mapping.
+//! Phase 11: Process Lifecycle — ELF loading, spawn, wait, getpid.
 
 // When running `cargo test`, use host std library.
 // When building for RISC-V, use no_std/no_main.
@@ -25,6 +25,8 @@ mod page_table;
 mod kvm;
 #[cfg(not(test))]
 mod process;
+#[cfg(not(test))]
+mod elf;
 
 
 // ── Kernel code (only compiled for RISC-V target, not during host tests) ──
@@ -112,7 +114,7 @@ mod kernel {
             alloc.allocated_count(), alloc.free_count());
         println!();
 
-        // === Phase 10: Create processes + launch scheduler ===
+        // === Phase 11: Create processes + launch scheduler ===
         // Creates init (PID 1) + UART server (PID 2), then srets to PID 1.
         // RPC between processes — init calls server, server prints + replies.
         // After all processes exit, control returns to post_process_exit().
