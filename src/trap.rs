@@ -231,13 +231,13 @@ pub extern "C" fn post_process_exit() -> ! {
     if cfg!(feature = "qemu") {
         println!("  (Ctrl-A X to exit QEMU)");
     } else {
-        println!("  (Ctrl-R to reboot)");
+        println!("  (Type R to reboot)");
     }
     println!();
     loop {
         if let Some(c) = uart.getc() {
             match c {
-                0x12 => {
+                0x12 | b'R' => {
                     println!("\n  Rebooting...");
                     // SBI System Reset
                     unsafe {
