@@ -14,6 +14,8 @@ use crate::{plic, platform, println};
 /// Syscall numbers — must match userspace programs.
 pub const SYS_PUTCHAR: usize = 0;
 pub const SYS_EXIT: usize = 1;
+pub const SYS_SEND: usize = 2;
+pub const SYS_RECEIVE: usize = 3;
 
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));
@@ -24,6 +26,7 @@ const TIMER_INTERVAL: u64 = platform::TIMER_INTERVAL;
 
 /// Trap frame layout — must match trap.S exactly.
 /// 31 GPRs + sstatus + sepc = 33 fields.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct TrapFrame {
     pub ra: usize,      // x1   offset 0x00
@@ -59,6 +62,21 @@ pub struct TrapFrame {
     pub t6: usize,      // x31  offset 0xF0
     pub sstatus: usize,  //      offset 0xF8
     pub sepc: usize,     //      offset 0x100
+}
+
+impl TrapFrame {
+    /// Create a zeroed trap frame (all registers = 0).
+    pub const fn zero() -> Self {
+        TrapFrame {
+            ra: 0, sp: 0, gp: 0, tp: 0,
+            t0: 0, t1: 0, t2: 0,
+            s0: 0, s1: 0,
+            a0: 0, a1: 0, a2: 0, a3: 0, a4: 0, a5: 0, a6: 0, a7: 0,
+            s2: 0, s3: 0, s4: 0, s5: 0, s6: 0, s7: 0, s8: 0, s9: 0, s10: 0, s11: 0,
+            t3: 0, t4: 0, t5: 0, t6: 0,
+            sstatus: 0, sepc: 0,
+        }
+    }
 }
 
 /// Tick counter — incremented on each timer interrupt.
@@ -168,46 +186,32 @@ fn handle_ecall(frame: &mut TrapFrame) {
 
     match syscall_num {
         SYS_PUTCHAR => {
-            // Write one character to UART
             let ch = frame.a0 as u8;
             crate::uart::Uart::platform().putc(ch);
-            frame.a0 = 0; // success
+            frame.a0 = 0;
+            frame.sepc += 4;
         }
         SYS_EXIT => {
-            let exit_code = frame.a0;
-            println!();
-            println!("  [kernel] Process exited with code {}", exit_code);
-
-            // Switch back to kernel page table
-            let kernel_satp = crate::kvm::kernel_satp();
-            unsafe {
-                asm!(
-                    "csrw satp, {0}",
-                    "sfence.vma zero, zero",
-                    in(reg) kernel_satp,
-                );
-            }
-
-            // Modify the trap frame so sret returns to S-mode
-            // at our post_process_exit function instead of user code.
-            // Set SPP = 1 (S-mode) in sstatus
-            frame.sstatus |= 1 << 8;
-            // Also re-enable interrupts on sret (SPIE = 1, bit 5)
-            frame.sstatus |= 1 << 5;
-            // Return to the kernel's post-exit idle loop
-            frame.sepc = post_process_exit as *const () as usize;
-
-            // sepc already points to the right place; don't advance by 4
+            crate::process::sys_exit(frame);
+            // sys_exit handles sepc — don't advance
+            return;
+        }
+        SYS_SEND => {
+            crate::process::sys_send(frame);
+            // sys_send handles sepc — don't advance
+            return;
+        }
+        SYS_RECEIVE => {
+            crate::process::sys_receive(frame);
+            // sys_receive handles sepc — don't advance
             return;
         }
         _ => {
             println!("\n  [kernel] Unknown syscall: {} (a0={:#x})", syscall_num, frame.a0);
-            frame.a0 = usize::MAX; // error
+            frame.a0 = usize::MAX;
+            frame.sepc += 4;
         }
     }
-
-    // Advance past the ecall instruction (4 bytes)
-    frame.sepc += 4;
 }
 
 /// Kernel re-entry point after a user process exits.

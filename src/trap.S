@@ -27,14 +27,33 @@
 .global _trap_vector
 
 _trap_vector:
-    # --- Swap sp and sscratch ---
+    # ┌─────────────────────────────────────────────────────────┐
+    # │ THE SP SWAP — the most important instruction in the OS  │
+    # │                                                         │
+    # │ csrrw does: tmp = sscratch; sscratch = sp; sp = tmp     │
+    # │ It's an atomic register swap between sp and sscratch.   │
+    # │                                                         │
+    # │ From U-mode (sscratch held kernel_sp):                  │
+    # │   BEFORE: sp = user_sp,   sscratch = kernel_sp          │
+    # │   AFTER:  sp = kernel_sp, sscratch = user_sp            │
+    # │   → We now have a valid kernel stack. User sp is safe   │
+    # │     in sscratch, we'll save it to the TrapFrame later.  │
+    # │                                                         │
+    # │ From S-mode (sscratch was 0, our convention):            │
+    # │   BEFORE: sp = kernel_sp, sscratch = 0                  │
+    # │   AFTER:  sp = 0,         sscratch = kernel_sp          │
+    # │   → sp is 0 (garbage). We detect this below and recover │
+    # │     kernel_sp from sscratch.                             │
+    # └─────────────────────────────────────────────────────────┘
     csrrw   sp, sscratch, sp
 
-    # If sp == 0, we came from S-mode (sscratch was 0)
+    # sp != 0 → came from U-mode, sp already holds kernel_sp, jump to save
+    # sp == 0 → came from S-mode, need to recover kernel_sp from sscratch
     bnez    sp, _trap_save
 
-    # From S-mode: kernel sp is now in sscratch, get it back
+    # S-mode recovery: sscratch has our kernel_sp (we swapped it there above)
     csrr    sp, sscratch
+    # Now: sp = kernel_sp, sscratch = kernel_sp (both same — that's fine)
 
 _trap_save:
     # --- Allocate trap frame (272 bytes) ---
@@ -43,11 +62,13 @@ _trap_save:
     # --- Save all general-purpose registers ---
     sd      x1,   0x00(sp)     # ra
 
-    # Save original sp: sscratch now holds whichever sp was swapped in.
-    # From U-mode: sscratch = user_sp.  From S-mode: sscratch = kernel_sp.
-    # Both are the "original sp" we want to preserve.
+    # Save the original sp that was in use BEFORE the trap.
+    # After the csrrw swap at entry:
+    #   From U-mode: sscratch = user_sp    (the user's stack pointer)
+    #   From S-mode: sscratch = kernel_sp  (same as current sp)
+    # Either way, sscratch holds the "original sp" we need to preserve.
     csrr    t0, sscratch
-    sd      t0,   0x08(sp)     # original sp (user or kernel)
+    sd      t0,   0x08(sp)     # frame.sp = original sp (user or kernel)
 
     sd      x3,   0x10(sp)     # gp
     sd      x4,   0x18(sp)     # tp
@@ -85,10 +106,17 @@ _trap_save:
     csrr    t0, sepc
     sd      t0,   0x100(sp)    # sepc
 
-    # Mark that we're in S-mode now: sscratch = 0
+    # Mark that we're now executing in S-mode: sscratch = 0.
+    # This is our convention — if a NESTED trap occurs while we're
+    # in the kernel, the entry code sees sscratch=0 → sp=0 → S-mode path.
+    # Without this, a nested trap would think sscratch holds a kernel_sp
+    # and corrupt the stack.
     csrw    sscratch, zero
 
     # --- Call Rust trap handler ---
+    # a0 = pointer to TrapFrame on the kernel stack.
+    # The handler may OVERWRITE this frame (context switch) — when it
+    # returns, the frame might contain a DIFFERENT process's registers.
     mv      a0, sp
     call    trap_handler
 
@@ -104,8 +132,21 @@ _trap_save:
     bnez    t0, _trap_restore_smode
 
 _trap_restore_umode:
-    # Returning to U-mode:
-    #   Need sp = user_sp, sscratch = kernel_sp (for next trap)
+    # ┌─────────────────────────────────────────────────────────┐
+    # │ RETURNING TO U-MODE — reverse the sp swap               │
+    # │                                                         │
+    # │ Goal: sp = user_sp, sscratch = kernel_sp                │
+    # │ (So the NEXT trap from U-mode can swap them again.)     │
+    # │                                                         │
+    # │ Strategy:                                                │
+    # │   1. Restore all GPRs except sp and t0 (need as temps)  │
+    # │   2. Load user_sp from frame into sscratch              │
+    # │   3. Restore t0 from frame                              │
+    # │   4. Deallocate frame (sp = kernel stack top)           │
+    # │   5. csrrw sp, sscratch, sp                             │
+    # │      → sp = user_sp, sscratch = kernel_sp              │
+    # │   6. sret → jump to sepc in U-mode                     │
+    # └─────────────────────────────────────────────────────────┘
 
     # Restore all GPRs except sp (x2) and t0 (x5) — need them as temps
     ld      x1,   0x00(sp)     # ra
@@ -140,17 +181,22 @@ _trap_restore_umode:
     ld      x30,  0xE8(sp)     # t5
     ld      x31,  0xF0(sp)     # t6
 
-    # Put user_sp into sscratch temporarily
-    ld      t0,   0x08(sp)     # user sp from frame
+    # --- The reverse sp swap (3 steps) ---
+
+    # Step 1: Stash user_sp into sscratch (temporary holding)
+    # State: sp = kernel_sp (frame base), sscratch = 0
+    ld      t0,   0x08(sp)     # t0 = user_sp (saved in frame at entry)
     csrw    sscratch, t0       # sscratch = user_sp
 
-    # Restore t0 (x5) from frame
-    ld      x5,   0x20(sp)     # t0
+    # Step 2: Restore the last temp register and free the frame
+    ld      x5,   0x20(sp)     # restore t0 (x5) — all GPRs now restored
+    addi    sp, sp, 272        # deallocate frame → sp = kernel stack top
 
-    # Deallocate trap frame: sp = kernel stack top
-    addi    sp, sp, 272
-
-    # Swap: sp = user_sp (from sscratch), sscratch = kernel_sp
+    # Step 3: THE REVERSE SWAP
+    #   BEFORE: sp = kernel_sp (stack top), sscratch = user_sp
+    #   AFTER:  sp = user_sp,              sscratch = kernel_sp
+    #   → User gets their stack back. Kernel sp is saved in sscratch
+    #     for the next trap entry.
     csrrw   sp, sscratch, sp
 
     sret

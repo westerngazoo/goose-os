@@ -1,6 +1,6 @@
 //! GooseOS — A RISC-V operating system written in Rust
 //!
-//! Part 6: First userspace process — ecall syscalls, U-mode execution.
+//! Part 7: Synchronous IPC — seL4-style message passing, context switching.
 
 // When running `cargo test`, use host std library.
 // When building for RISC-V, use no_std/no_main.
@@ -111,10 +111,11 @@ mod kernel {
             page_alloc.allocated_count(), page_alloc.free_count());
         println!();
 
-        // === Phase 9: Launch first userspace process ===
-        // This never returns — after the process exits, control goes
-        // to post_process_exit() via the ecall handler.
-        process::launch_init(&mut page_alloc);
+        // === Phase 9: Create processes + launch scheduler ===
+        // Creates init (PID 1) + UART server (PID 2), then srets to PID 1.
+        // IPC between processes — init sends chars, server prints them.
+        // After all processes exit, control returns to post_process_exit().
+        process::launch(&mut page_alloc);
     }
 
     /// Panic handler — prints location and message, then halts.
