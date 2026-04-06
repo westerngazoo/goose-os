@@ -85,6 +85,14 @@ impl Uart {
         }
     }
 
+    /// Disable receive-data-available interrupts.
+    /// Used when switching to polling mode (e.g., kernel idle loop).
+    pub fn disable_rx_interrupt(&self) {
+        unsafe {
+            ptr::write_volatile(self.reg(1), 0x00);
+        }
+    }
+
     /// Non-blocking read. Returns Some(byte) if data is available.
     pub fn getc(&self) -> Option<u8> {
         unsafe {

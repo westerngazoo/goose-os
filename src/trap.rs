@@ -220,6 +220,12 @@ fn handle_ecall(frame: &mut TrapFrame) {
 /// Runs in S-mode with kernel satp. Enters the idle loop.
 #[no_mangle]
 pub extern "C" fn post_process_exit() -> ! {
+    // Disable UART RX interrupts — the idle loop polls directly.
+    // Without this, handle_interrupt() drains the RX FIFO before
+    // our getc() polling loop ever sees the keystroke.
+    let uart = crate::uart::Uart::platform();
+    uart.disable_rx_interrupt();
+
     println!("  [kernel] Back in S-mode. Idle loop active.");
     println!();
     if cfg!(feature = "qemu") {
@@ -228,8 +234,6 @@ pub extern "C" fn post_process_exit() -> ! {
         println!("  (Ctrl-R to reboot)");
     }
     println!();
-
-    let uart = crate::uart::Uart::platform();
     loop {
         if let Some(c) = uart.getc() {
             match c {
