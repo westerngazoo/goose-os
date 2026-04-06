@@ -16,6 +16,8 @@ pub const SYS_PUTCHAR: usize = 0;
 pub const SYS_EXIT: usize = 1;
 pub const SYS_SEND: usize = 2;
 pub const SYS_RECEIVE: usize = 3;
+pub const SYS_CALL: usize = 4;
+pub const SYS_REPLY: usize = 5;
 
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));
@@ -204,6 +206,16 @@ fn handle_ecall(frame: &mut TrapFrame) {
         SYS_RECEIVE => {
             crate::process::sys_receive(frame);
             // sys_receive handles sepc — don't advance
+            return;
+        }
+        SYS_CALL => {
+            crate::process::sys_call(frame);
+            // sys_call handles sepc — don't advance
+            return;
+        }
+        SYS_REPLY => {
+            crate::process::sys_reply(frame);
+            // sys_reply handles sepc — don't advance
             return;
         }
         _ => {

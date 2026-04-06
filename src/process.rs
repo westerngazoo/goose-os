@@ -1,16 +1,19 @@
 /// Process management — process table, IPC, context switching.
 ///
-/// Part 7: Synchronous IPC (seL4-style).
+/// Phase 9: Call/Reply IPC (seL4-style RPC).
 ///
 /// Design:
 ///   - Fixed-size process table (no dynamic allocation in kernel)
 ///   - Synchronous send/receive: sender blocks until receiver picks up
+///   - Call/Reply: RPC in one ecall (send + wait for reply)
 ///   - Context switch via TrapFrame save/restore on the kernel stack
 ///   - Each process has its own Sv39 page table
 ///
 /// IPC model:
 ///   SYS_SEND(target, msg)   — blocks until target calls RECEIVE
 ///   SYS_RECEIVE(from)       — blocks until someone sends to us
+///   SYS_CALL(target, msg)   — send + block for SYS_REPLY (RPC)
+///   SYS_REPLY(target, reply)— deliver reply to BlockedCall process (non-blocking)
 ///   Rendezvous: when send and receive meet, message transfers, both unblock.
 ///   This is the seL4 model — no kernel-side message queues, no allocation.
 
@@ -34,6 +37,7 @@ pub enum ProcessState {
     Running,        // Currently executing
     BlockedSend,    // Waiting for receiver to call RECEIVE
     BlockedRecv,    // Waiting for sender to call SEND
+    BlockedCall,    // Sent via SYS_CALL, waiting for SYS_REPLY
 }
 
 // ── Process Control Block ──────────────────────────────────────
@@ -73,8 +77,9 @@ static mut CURRENT_PID: usize = 0;
 
 // ── Embedded User Programs ─────────────────────────────────────
 
-// Program 1: init (PID 1)
-// Sends "Honk! IPC works!\n" to PID 2, one character per SYS_SEND.
+// Program 1: init (PID 1) — RPC client
+// Uses SYS_CALL to send "Honk! RPC works!\n" to PID 2, one char per call.
+// Each SYS_CALL blocks until the server replies — true RPC.
 // Then exits with code 0.
 global_asm!(r#"
 .section .text
@@ -84,60 +89,77 @@ global_asm!(r#"
 
 _user_init_start:
     # ─── GooseOS init process (PID 1) ───
-    # Sends each character to the UART server (PID 2) via SYS_SEND.
-    # Syscall: a7=2 (SYS_SEND), a0=target PID, a1=message value
+    # RPC client: calls server (PID 2) with each character via SYS_CALL.
+    # SYS_CALL: a7=4, a0=target PID, a1=message value
+    # Returns: a0=reply value (0 = ACK from server)
 
     li      s0, 2           # target PID (s0 survives ecalls)
-    li      a7, 2           # SYS_SEND
 
+    li a7, 4
     mv a0, s0
     li a1, 0x48             # 'H'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x6F             # 'o'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x6E             # 'n'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x6B             # 'k'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x21             # '!'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x20             # ' '
     ecall
+    li a7, 4
     mv a0, s0
-    li a1, 0x49             # 'I'
+    li a1, 0x52             # 'R'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x50             # 'P'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x43             # 'C'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x20             # ' '
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x77             # 'w'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x6F             # 'o'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x72             # 'r'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x6B             # 'k'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x73             # 's'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x21             # '!'
     ecall
+    li a7, 4
     mv a0, s0
     li a1, 0x0A             # '\n'
     ecall
@@ -151,8 +173,9 @@ _user_init_start:
 _user_init_end:
 "#);
 
-// Program 2: UART server (PID 2)
-// Infinite loop: receive a message (character), print it via SYS_PUTCHAR.
+// Program 2: UART server (PID 2) — RPC server
+// Infinite loop: RECEIVE a call, print character via PUTCHAR, REPLY to caller.
+// This is the server side of the SYS_CALL/SYS_REPLY RPC pattern.
 global_asm!(r#"
 .section .text
 .balign 4
@@ -161,19 +184,26 @@ global_asm!(r#"
 
 _user_srv_start:
     # ─── GooseOS UART server (PID 2) ───
-    # Receives messages from any process, prints each character.
-    # Syscall: a7=3 (SYS_RECEIVE), a0=from_pid (0=any)
+    # RPC server: receives messages, prints them, replies with ACK.
+    # SYS_RECEIVE: a7=3, a0=from_pid (0=any)
     # Returns: a0=message value, a1=sender PID
+    # SYS_REPLY: a7=5, a0=caller PID, a1=reply value
 1:
     li      a7, 3           # SYS_RECEIVE
     li      a0, 0           # from any sender
     ecall
-    # a0 now = character, a1 = sender PID
+    # a0 = character, a1 = sender PID
 
-    mv      s0, a0          # save character (s0 survives ecalls)
+    mv      s0, a0          # save character
+    mv      s1, a1          # save sender PID (need it for REPLY)
 
     li      a7, 0           # SYS_PUTCHAR
     mv      a0, s0          # the character
+    ecall
+
+    li      a7, 5           # SYS_REPLY
+    mv      a0, s1          # reply to the caller
+    li      a1, 0           # reply value = 0 (ACK)
     ecall
 
     j       1b              # loop forever
@@ -309,6 +339,98 @@ pub fn launch(alloc: &mut BitmapAllocator) -> ! {
 
 // ── Syscall Handlers ───────────────────────────────────────────
 
+/// SYS_CALL(target_pid, msg_value) — synchronous RPC (send + wait for reply).
+///
+/// Convention: a0 = target PID, a1 = message value.
+/// Returns:    a0 = reply value (set by SYS_REPLY from server).
+///
+/// The caller sends a message and blocks until the target calls SYS_REPLY.
+/// This halves the syscall cost of an RPC round-trip compared to
+/// separate SYS_SEND + SYS_RECEIVE — one ecall instead of two.
+///
+/// Behavior:
+///   - If target is BlockedRecv: rendezvous (deliver msg), but caller
+///     stays BlockedCall until the target does SYS_REPLY.
+///   - If target is NOT BlockedRecv: caller blocks as BlockedCall,
+///     msg waits until target calls SYS_RECEIVE.
+pub fn sys_call(frame: &mut TrapFrame) {
+    frame.sepc += 4; // advance past ecall (saved with context)
+
+    let current = unsafe { CURRENT_PID };
+    let target_pid = frame.a0;
+    let msg_value = frame.a1;
+
+    // Validate target
+    if target_pid == 0 || target_pid >= MAX_PROCS || target_pid == current {
+        frame.a0 = usize::MAX; // error
+        return;
+    }
+
+    unsafe {
+        let target_state = PROCS[target_pid].state;
+        let target_wants = PROCS[target_pid].ipc_target;
+
+        // Check if target is blocked on RECEIVE (from us or from any)
+        if target_state == ProcessState::BlockedRecv
+            && (target_wants == 0 || target_wants == current)
+        {
+            // Rendezvous! Deliver message to receiver's saved context.
+            PROCS[target_pid].context.a0 = msg_value;  // message
+            PROCS[target_pid].context.a1 = current;     // sender PID
+            PROCS[target_pid].state = ProcessState::Ready;
+        }
+
+        // Caller ALWAYS blocks — even after rendezvous.
+        // The difference from SYS_SEND: SYS_SEND unblocks on rendezvous,
+        // SYS_CALL stays blocked waiting for SYS_REPLY.
+        PROCS[current].ipc_target = target_pid;
+        PROCS[current].ipc_value = msg_value;
+        PROCS[current].state = ProcessState::BlockedCall;
+
+        schedule(frame, current);
+    }
+}
+
+/// SYS_REPLY(target_pid, reply_value) — deliver reply to a SYS_CALL caller.
+///
+/// Convention: a0 = caller PID, a1 = reply value.
+/// Returns:    a0 = 0 (success), usize::MAX (error).
+///
+/// Non-blocking for the server — it continues running after replying.
+/// The target must be in BlockedCall state and must have called US.
+/// This prevents random processes from replying to calls they didn't receive.
+pub fn sys_reply(frame: &mut TrapFrame) {
+    frame.sepc += 4;
+
+    let current = unsafe { CURRENT_PID };
+    let target_pid = frame.a0;
+    let reply_value = frame.a1;
+
+    // Validate target
+    if target_pid == 0 || target_pid >= MAX_PROCS || target_pid == current {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    unsafe {
+        // Target must be BlockedCall AND must have called us
+        if PROCS[target_pid].state == ProcessState::BlockedCall
+            && PROCS[target_pid].ipc_target == current
+        {
+            // Deliver reply to caller's saved context
+            PROCS[target_pid].context.a0 = reply_value;
+            PROCS[target_pid].state = ProcessState::Ready;
+
+            // Server continues — non-blocking
+            frame.a0 = 0;
+            return;
+        }
+
+        // No matching BlockedCall — error
+        frame.a0 = usize::MAX;
+    }
+}
+
 /// SYS_SEND(target_pid, msg_value) — synchronous send.
 ///
 /// Convention: a0 = target PID, a1 = message value.
@@ -371,9 +493,17 @@ pub fn sys_receive(frame: &mut TrapFrame) {
     let from_pid = frame.a0; // 0 = any
 
     unsafe {
-        // Check if any sender is blocked waiting to send to us
+        // Check if any sender is blocked waiting to send to us.
+        // Match both BlockedSend (from SYS_SEND) and BlockedCall (from SYS_CALL).
+        // The server's RECEIVE doesn't care how the sender sent — it gets the
+        // message either way. The difference is what happens when the server
+        // replies: BlockedSend processes were already unblocked, BlockedCall
+        // processes stay blocked until SYS_REPLY delivers the response.
         for i in 1..MAX_PROCS {
-            if PROCS[i].state == ProcessState::BlockedSend
+            let is_sender = PROCS[i].state == ProcessState::BlockedSend
+                || PROCS[i].state == ProcessState::BlockedCall;
+
+            if is_sender
                 && PROCS[i].ipc_target == current
                 && (from_pid == 0 || from_pid == i)
             {
@@ -381,9 +511,14 @@ pub fn sys_receive(frame: &mut TrapFrame) {
                 let msg = PROCS[i].ipc_value;
                 let sender = i;
 
-                // Unblock sender — its SEND returns success
-                PROCS[i].state = ProcessState::Ready;
-                PROCS[i].context.a0 = 0; // send returns 0
+                // Unblock sender ONLY if it was a plain SEND.
+                // BlockedCall stays blocked — it's waiting for SYS_REPLY.
+                if PROCS[i].state == ProcessState::BlockedSend {
+                    PROCS[i].state = ProcessState::Ready;
+                    PROCS[i].context.a0 = 0; // send returns 0
+                }
+                // BlockedCall: leave state as BlockedCall, target stays set.
+                // SYS_REPLY will unblock it later.
 
                 // Receiver gets the message
                 frame.a0 = msg;
