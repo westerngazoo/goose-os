@@ -265,7 +265,14 @@ pub extern "C" fn post_process_exit() -> ! {
                 }
                 b'\r' | b'\n' => { uart.putc(b'\r'); uart.putc(b'\n'); }
                 0x7F | 0x08 => { uart.putc(0x08); uart.putc(b' '); uart.putc(0x08); }
-                _ => uart.putc(c),
+                _ => {
+                    if c < 0x20 || c > 0x7E {
+                        // Non-printable — show hex so we can debug what arrives
+                        println!("[0x{:02x}]", c);
+                    } else {
+                        uart.putc(c);
+                    }
+                }
             }
         }
     }
