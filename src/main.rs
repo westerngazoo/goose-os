@@ -1,6 +1,6 @@
 //! GooseOS — A RISC-V operating system written in Rust
 //!
-//! Part 7: Synchronous IPC — seL4-style message passing, context switching.
+//! Phase 10: Memory Management — userspace page allocation and mapping.
 
 // When running `cargo test`, use host std library.
 // When building for RISC-V, use no_std/no_main.
@@ -100,22 +100,23 @@ mod kernel {
         trap::interrupts_enable();
 
         // === Phase 7: Initialize page allocator ===
-        let mut page_alloc = page_alloc::init_from_linker();
-        page_alloc::self_test(&mut page_alloc);
+        page_alloc::init();
+        page_alloc::self_test();
 
         // === Phase 8: Build kernel page table + enable MMU ===
-        let root_pt = kvm::init(&mut page_alloc);
+        let root_pt = kvm::init();
         unsafe { kvm::enable_mmu(root_pt); }
 
+        let alloc = unsafe { page_alloc::get() };
         println!("  [page_alloc] {} pages used for page tables, {} free",
-            page_alloc.allocated_count(), page_alloc.free_count());
+            alloc.allocated_count(), alloc.free_count());
         println!();
 
-        // === Phase 9: Create processes + launch scheduler ===
+        // === Phase 10: Create processes + launch scheduler ===
         // Creates init (PID 1) + UART server (PID 2), then srets to PID 1.
-        // IPC between processes — init sends chars, server prints them.
+        // RPC between processes — init calls server, server prints + replies.
         // After all processes exit, control returns to post_process_exit().
-        process::launch(&mut page_alloc);
+        process::launch();
     }
 
     /// Panic handler — prints location and message, then halts.

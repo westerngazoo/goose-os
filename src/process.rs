@@ -1,6 +1,6 @@
-/// Process management — process table, IPC, context switching.
+/// Process management — process table, IPC, context switching, memory syscalls.
 ///
-/// Phase 9: Call/Reply IPC (seL4-style RPC).
+/// Phase 10: Memory Management (alloc, map, unmap, free).
 ///
 /// Design:
 ///   - Fixed-size process table (no dynamic allocation in kernel)
@@ -18,7 +18,7 @@
 ///   This is the seL4 model — no kernel-side message queues, no allocation.
 
 use core::arch::{asm, global_asm};
-use crate::page_alloc::{BitmapAllocator, PAGE_SIZE};
+use crate::page_alloc::PAGE_SIZE;
 use crate::page_table::*;
 use crate::trap::TrapFrame;
 use crate::kvm;
@@ -77,10 +77,10 @@ static mut CURRENT_PID: usize = 0;
 
 // ── Embedded User Programs ─────────────────────────────────────
 
-// Program 1: init (PID 1) — RPC client
-// Uses SYS_CALL to send "Honk! RPC works!\n" to PID 2, one char per call.
-// Each SYS_CALL blocks until the server replies — true RPC.
-// Then exits with code 0.
+// Program 1: init (PID 1) — Memory test + RPC client
+// Phase 10: Allocates a page, maps it, writes/reads a test byte,
+// then reports the result via SYS_CALL to the server.
+// Demonstrates: SYS_ALLOC_PAGES → SYS_MAP → write → read → SYS_CALL → SYS_UNMAP → SYS_FREE_PAGES
 global_asm!(r#"
 .section .text
 .balign 4
@@ -89,87 +89,97 @@ global_asm!(r#"
 
 _user_init_start:
     # ─── GooseOS init process (PID 1) ───
-    # RPC client: calls server (PID 2) with each character via SYS_CALL.
-    # SYS_CALL: a7=4, a0=target PID, a1=message value
-    # Returns: a0=reply value (0 = ACK from server)
+    # Phase 10: Memory management test + RPC output.
+    #
+    # Registers:
+    #   s0 = server PID (2)
+    #   s1 = allocated physical address
+    #   s2 = virtual address for mapping (0x60000000)
 
-    li      s0, 2           # target PID (s0 survives ecalls)
+    li      s0, 2               # server PID
+    li      s2, 0x60000000      # target VA for mapped page
 
+    # ── Step 1: Allocate a physical page ──
+    li      a7, 8               # SYS_ALLOC_PAGES
+    li      a0, 1               # count = 1
+    ecall
+    # a0 = physical address (or -1 on error)
+    li      t0, -1
+    beq     a0, t0, .fail
+    mv      s1, a0              # save phys addr
+
+    # ── Step 2: Map it at VA 0x60000000 (USER_RW) ──
+    li      a7, 6               # SYS_MAP
+    mv      a0, s1              # physical address
+    mv      a1, s2              # virtual address
+    li      a2, 0               # flags = 0 (USER_RW)
+    ecall
+    li      t0, -1
+    beq     a0, t0, .fail
+
+    # ── Step 3: Write test byte to mapped page ──
+    li      t0, 0x42            # 'B' (test value)
+    sb      t0, 0(s2)           # store at VA 0x60000000
+
+    # ── Step 4: Read it back and verify ──
+    lbu     t1, 0(s2)           # load unsigned byte
+    bne     t0, t1, .fail       # if mismatch → fail
+
+    # ── Step 5: Success! Report via RPC: "Pg ok!\n" ──
     li a7, 4
     mv a0, s0
-    li a1, 0x48             # 'H'
+    li a1, 0x50                 # 'P'
     ecall
     li a7, 4
     mv a0, s0
-    li a1, 0x6F             # 'o'
+    li a1, 0x67                 # 'g'
     ecall
     li a7, 4
     mv a0, s0
-    li a1, 0x6E             # 'n'
+    li a1, 0x20                 # ' '
     ecall
     li a7, 4
     mv a0, s0
-    li a1, 0x6B             # 'k'
+    li a1, 0x6F                 # 'o'
     ecall
     li a7, 4
     mv a0, s0
-    li a1, 0x21             # '!'
+    li a1, 0x6B                 # 'k'
     ecall
     li a7, 4
     mv a0, s0
-    li a1, 0x20             # ' '
+    li a1, 0x21                 # '!'
     ecall
     li a7, 4
     mv a0, s0
-    li a1, 0x52             # 'R'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x50             # 'P'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x43             # 'C'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x20             # ' '
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x77             # 'w'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x6F             # 'o'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x72             # 'r'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x6B             # 'k'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x73             # 's'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x21             # '!'
-    ecall
-    li a7, 4
-    mv a0, s0
-    li a1, 0x0A             # '\n'
+    li a1, 0x0A                 # '\n'
     ecall
 
-    # Exit
-    li      a7, 1           # SYS_EXIT
-    li      a0, 0           # exit code 0
+    # ── Step 6: Cleanup — unmap + free ──
+    li      a7, 7               # SYS_UNMAP
+    mv      a0, s2              # virtual address
+    ecall
+
+    li      a7, 9               # SYS_FREE_PAGES
+    mv      a0, s1              # physical address
+    li      a1, 1               # count = 1
+    ecall
+
+    # Exit success
+    li      a7, 1               # SYS_EXIT
+    li      a0, 0               # code 0
     ecall
 
 1:  j       1b
+
+.fail:
+    # Memory test failed — exit with code 1
+    li      a7, 1               # SYS_EXIT
+    li      a0, 1               # code 1 (failure)
+    ecall
+
+2:  j       2b
+
 _user_init_end:
 "#);
 
@@ -225,12 +235,11 @@ fn create_process(
     pid: usize,
     code_start: usize,
     code_size: usize,
-    alloc: &mut BitmapAllocator,
 ) {
     assert!(pid > 0 && pid < MAX_PROCS, "invalid PID");
 
     // Allocate user code page and copy program
-    let user_code = kvm::alloc_zeroed_page(alloc);
+    let user_code = kvm::alloc_zeroed_page();
     unsafe {
         let src = code_start as *const u8;
         let dst = user_code as *mut u8;
@@ -240,14 +249,14 @@ fn create_process(
     }
 
     // Allocate user stack (one page, sp starts at top)
-    let user_stack = kvm::alloc_zeroed_page(alloc);
+    let user_stack = kvm::alloc_zeroed_page();
     let user_sp = user_stack + PAGE_SIZE;
 
     // Build user page table
-    let user_root = kvm::alloc_zeroed_page(alloc);
-    kvm::map_kernel_regions(user_root, alloc);
-    kvm::map_range(user_root, user_code, user_code + PAGE_SIZE, USER_RX, alloc);
-    kvm::map_range(user_root, user_stack, user_stack + PAGE_SIZE, USER_RW, alloc);
+    let user_root = kvm::alloc_zeroed_page();
+    kvm::map_kernel_regions(user_root);
+    kvm::map_range(user_root, user_code, user_code + PAGE_SIZE, USER_RX);
+    kvm::map_range(user_root, user_stack, user_stack + PAGE_SIZE, USER_RW);
 
     let satp = make_satp(user_root, pid as u16);
 
@@ -278,7 +287,7 @@ fn create_process(
 ///
 /// This is called from kmain as Phase 9. It never returns —
 /// after all processes exit, control goes to post_process_exit().
-pub fn launch(alloc: &mut BitmapAllocator) -> ! {
+pub fn launch() -> ! {
     extern "C" {
         static _user_init_start: u8;
         static _user_init_end: u8;
@@ -294,9 +303,10 @@ pub fn launch(alloc: &mut BitmapAllocator) -> ! {
 
     println!("  [proc] Creating processes...");
 
-    create_process(1, init_start, init_size, alloc);
-    create_process(2, srv_start, srv_size, alloc);
+    create_process(1, init_start, init_size);
+    create_process(2, srv_start, srv_size);
 
+    let alloc = unsafe { crate::page_alloc::get() };
     println!();
     println!("  [page_alloc] {} pages used, {} free",
         alloc.allocated_count(), alloc.free_count());
@@ -430,6 +440,168 @@ pub fn sys_reply(frame: &mut TrapFrame) {
         frame.a0 = usize::MAX;
     }
 }
+
+// ── Memory Management Syscalls ────────────────────────────────
+
+/// SYS_MAP(phys, virt, flags) — map a physical page into caller's address space.
+///
+/// Convention: a0 = physical address, a1 = virtual address, a2 = flags.
+///   flags: 0 = USER_RW, 1 = USER_RX
+/// Returns: a0 = 0 (success), usize::MAX (error).
+///
+/// Validates:
+///   - phys and virt are page-aligned
+///   - virt is in user-mappable range (not kernel space)
+///   - phys was allocated via SYS_ALLOC_PAGES
+pub fn sys_map(frame: &mut TrapFrame) {
+    frame.sepc += 4;
+
+    let phys = frame.a0;
+    let virt = frame.a1;
+    let flags_arg = frame.a2;
+
+    // Validate alignment
+    if phys % PAGE_SIZE != 0 || virt % PAGE_SIZE != 0 {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    // Validate virt is in user range (below kernel space).
+    // Reject addresses in kernel region and MMIO regions.
+    // Simple check: user VA must be >= 0x5000_0000 and < 0x8000_0000
+    // (avoids UART at 0x1000_0000, PLIC at 0x0C00_0000, kernel at 0x8020_0000+)
+    if virt < 0x5000_0000 || virt >= 0x8000_0000 {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    // Validate phys is an allocated page
+    let alloc = unsafe { crate::page_alloc::get() };
+    if !alloc.is_allocated(phys) {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    // Map flags: 0 = USER_RW, 1 = USER_RX
+    let pte_flags = match flags_arg {
+        0 => crate::page_table::USER_RW,
+        1 => crate::page_table::USER_RX,
+        _ => {
+            frame.a0 = usize::MAX;
+            return;
+        }
+    };
+
+    // Get current process's page table root
+    let current = unsafe { CURRENT_PID };
+    let satp = unsafe { PROCS[current].satp };
+    let root = kvm::satp_to_root(satp);
+
+    // Map the page
+    kvm::map_user_page(root, virt, phys, pte_flags);
+
+    // Flush TLB for this VA
+    unsafe {
+        core::arch::asm!("sfence.vma {}, zero", in(reg) virt);
+    }
+
+    frame.a0 = 0;
+}
+
+/// SYS_UNMAP(virt) — remove a page mapping from caller's address space.
+///
+/// Convention: a0 = virtual address.
+/// Returns: a0 = 0 (success), usize::MAX (error).
+///
+/// Does NOT free the physical page — use SYS_FREE_PAGES for that.
+pub fn sys_unmap(frame: &mut TrapFrame) {
+    frame.sepc += 4;
+
+    let virt = frame.a0;
+
+    if virt % PAGE_SIZE != 0 {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    let current = unsafe { CURRENT_PID };
+    let satp = unsafe { PROCS[current].satp };
+    let root = kvm::satp_to_root(satp);
+
+    if kvm::unmap_page(root, virt) {
+        // Flush TLB for this VA
+        unsafe {
+            core::arch::asm!("sfence.vma {}, zero", in(reg) virt);
+        }
+        frame.a0 = 0;
+    } else {
+        frame.a0 = usize::MAX;
+    }
+}
+
+/// SYS_ALLOC_PAGES(count) — allocate physical pages.
+///
+/// Convention: a0 = count (must be 1 for now).
+/// Returns: a0 = physical address of allocated page, usize::MAX on error.
+///
+/// The page is zeroed before returning. Caller must SYS_MAP it
+/// before accessing it — the page is not automatically mapped.
+pub fn sys_alloc_pages(frame: &mut TrapFrame) {
+    frame.sepc += 4;
+
+    let count = frame.a0;
+
+    // Only single-page allocations for now
+    if count != 1 {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    let alloc = unsafe { crate::page_alloc::get() };
+    match alloc.alloc() {
+        Ok(phys) => {
+            unsafe { crate::page_alloc::BitmapAllocator::zero_page(phys); }
+            frame.a0 = phys;
+        }
+        Err(_) => {
+            frame.a0 = usize::MAX;
+        }
+    }
+}
+
+/// SYS_FREE_PAGES(phys, count) — return physical pages to the kernel.
+///
+/// Convention: a0 = physical address, a1 = count (must be 1 for now).
+/// Returns: a0 = 0 (success), usize::MAX (error).
+///
+/// The page is zeroed (security: don't leak data between processes).
+/// Caller should SYS_UNMAP first if the page is still mapped.
+pub fn sys_free_pages(frame: &mut TrapFrame) {
+    frame.sepc += 4;
+
+    let phys = frame.a0;
+    let count = frame.a1;
+
+    if count != 1 {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    // Zero the page before freeing (security)
+    unsafe { crate::page_alloc::BitmapAllocator::zero_page(phys); }
+
+    let alloc = unsafe { crate::page_alloc::get() };
+    match alloc.free(phys) {
+        Ok(()) => {
+            frame.a0 = 0;
+        }
+        Err(_) => {
+            frame.a0 = usize::MAX;
+        }
+    }
+}
+
+// ── IPC Syscall Handlers ──────────────────────────────────────
 
 /// SYS_SEND(target_pid, msg_value) — synchronous send.
 ///

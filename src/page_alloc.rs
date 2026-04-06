@@ -26,6 +26,19 @@ pub enum AllocError {
     NotAligned,
 }
 
+// ── Global allocator instance ─────────────────────────────────
+// Lives in .bss as zeroed memory, initialized once at boot.
+// After init(), accessible from anywhere (boot code + syscall handlers).
+static mut ALLOC: BitmapAllocator = BitmapAllocator::new(0, 0);
+
+/// Get a mutable reference to the global page allocator.
+///
+/// # Safety
+/// Caller must ensure single-threaded access (single-hart + interrupts off).
+pub unsafe fn get() -> &'static mut BitmapAllocator {
+    &mut *core::ptr::addr_of_mut!(ALLOC)
+}
+
 /// Bitmap page allocator.
 ///
 /// Formal properties:
@@ -199,12 +212,13 @@ impl BitmapAllocator {
 
 // ── Kernel integration (not available during host tests) ────────
 
-/// Initialize the page allocator from linker-script symbols.
+/// Initialize the global page allocator from linker-script symbols.
 ///
 /// This is the ONLY function that touches linker symbols.
 /// Everything else is pure logic operating on the BitmapAllocator struct.
+/// After this call, use `get()` to access the allocator from anywhere.
 #[cfg(not(test))]
-pub fn init_from_linker() -> BitmapAllocator {
+pub fn init() {
     extern "C" {
         static _end: u8;
         static _heap_end: u8;
@@ -217,18 +231,22 @@ pub fn init_from_linker() -> BitmapAllocator {
     let base = (free_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let num_pages = (free_end - base) / PAGE_SIZE;
 
-    let mut alloc = BitmapAllocator::new(base, num_pages);
-    alloc.init();
-    alloc
+    unsafe {
+        core::ptr::addr_of_mut!(ALLOC).write(BitmapAllocator::new(base, num_pages));
+        (*core::ptr::addr_of_mut!(ALLOC)).init();
+    }
 }
 
 /// Boot self-test — run at startup to verify allocator correctness.
 ///
 /// This is a runtime proof that the core invariants hold on this hardware.
 /// If any assertion fails, the kernel panics before enabling the MMU.
+/// Uses the global allocator (must call init() first).
 #[cfg(not(test))]
-pub fn self_test(alloc: &mut BitmapAllocator) {
+pub fn self_test() {
     use crate::println;
+
+    let alloc = unsafe { get() };
 
     // Invariant 1: all pages start free
     assert_eq!(alloc.allocated_count(), 0, "pages should start free");
