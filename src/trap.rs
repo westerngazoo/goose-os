@@ -25,13 +25,13 @@ pub const SYS_FREE_PAGES: usize = 9;
 pub const SYS_SPAWN: usize = 10;
 pub const SYS_WAIT: usize = 11;
 pub const SYS_GETPID: usize = 12;
+pub const SYS_YIELD: usize = 13;
 
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));
 
 // Platform-aware constants
 const UART0_IRQ: u32 = platform::UART0_IRQ;
-const TIMER_INTERVAL: u64 = platform::TIMER_INTERVAL;
 
 /// Trap frame layout — must match trap.S exactly.
 /// 31 GPRs + sstatus + sepc = 33 fields.
@@ -124,8 +124,8 @@ pub fn interrupts_enable() {
 /// Arm the first timer interrupt.
 pub fn timer_init() {
     let time = read_time();
-    sbi_set_timer(time + TIMER_INTERVAL);
-    println!("  [trap] timer armed (1s interval, timebase=10MHz)");
+    sbi_set_timer(time + platform::TIMESLICE);
+    println!("  [trap] timer armed (50ms timeslice, timebase=10MHz)");
 }
 
 /// Rust trap dispatcher — called from trap.S with pointer to TrapFrame.
@@ -143,7 +143,7 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
 
     if is_interrupt {
         match code {
-            5 => handle_timer(),
+            5 => handle_timer(frame),
             9 => handle_external(),
             _ => {
                 println!("\n[trap] unhandled interrupt: code={}", code);
@@ -252,6 +252,10 @@ fn handle_ecall(frame: &mut TrapFrame) {
             crate::process::sys_getpid(frame);
             return;
         }
+        SYS_YIELD => {
+            crate::process::sys_yield(frame);
+            return;
+        }
         _ => {
             println!("\n  [kernel] Unknown syscall: {} (a0={:#x})", syscall_num, frame.a0);
             frame.a0 = usize::MAX;
@@ -332,17 +336,29 @@ fn handle_external() {
 }
 
 /// Handle supervisor timer interrupt.
-fn handle_timer() {
+///
+/// Two roles:
+///   1. Wallclock display (every TIMER_INTERVAL ticks)
+///   2. Preemptive scheduling (every TIMESLICE) — forcibly switch processes
+///      when the timer fires during user-mode execution.
+fn handle_timer(frame: &mut TrapFrame) {
     unsafe { TICKS += 1; }
 
     let ticks = unsafe { TICKS };
-    if ticks % 10 == 0 {
-        println!("[timer] {} seconds", ticks);
+    // Wallclock: print every 200 ticks (200 × 50ms = 10 seconds)
+    if ticks % 200 == 0 {
+        println!("[timer] {} seconds", ticks / 20);
     }
 
-    // Re-arm for next tick
+    // Re-arm for next timeslice
     let time = read_time();
-    sbi_set_timer(time + TIMER_INTERVAL);
+    sbi_set_timer(time + platform::TIMESLICE);
+
+    // Preempt if we were running a user process.
+    // sstatus.SPP (bit 8) = 0 means we came from U-mode.
+    if frame.sstatus & (1 << 8) == 0 {
+        crate::process::preempt(frame);
+    }
 }
 
 /// Read the RISC-V time CSR.
