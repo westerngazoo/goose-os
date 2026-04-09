@@ -125,7 +125,7 @@ pub fn interrupts_enable() {
 pub fn timer_init() {
     let time = read_time();
     sbi_set_timer(time + platform::TIMESLICE);
-    println!("  [trap] timer armed (50ms timeslice, timebase=10MHz)");
+    println!("  [trap] timer armed (10ms timeslice, timebase=10MHz)");
 }
 
 /// Rust trap dispatcher — called from trap.S with pointer to TrapFrame.
@@ -345,9 +345,9 @@ fn handle_timer(frame: &mut TrapFrame) {
     unsafe { TICKS += 1; }
 
     let ticks = unsafe { TICKS };
-    // Wallclock: print every 200 ticks (200 × 50ms = 10 seconds)
-    if ticks % 200 == 0 {
-        println!("[timer] {} seconds", ticks / 20);
+    // Wallclock: print every 1000 ticks (1000 × 10ms = 10 seconds)
+    if ticks % 1000 == 0 {
+        println!("[timer] {} seconds", ticks / 100);
     }
 
     // Re-arm for next timeslice

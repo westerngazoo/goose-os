@@ -101,10 +101,10 @@ const SPINNER_ELF: [u8; 148] = [
 ];
 
 /// Goose counter: GETPID → derive char → busy-delay → print × 50 → exit.
-/// Each goose spins 50K iterations in U-mode between PUTCHAR calls,
+/// Each goose spins 1M iterations in U-mode between PUTCHAR calls,
 /// giving the timer interrupt a window to preempt. This produces the
 /// visible interleaving that proves preemptive scheduling works.
-/// PID 3→'A', PID 4→'B', PID 5→'C'.
+/// PID 2→'A', PID 3→'B', PID 4→'C'.
 /// 200 bytes, entry=0x10078.
 const GOOSE_ELF: [u8; 200] = [
     0x7F, 0x45, 0x4C, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -115,8 +115,8 @@ const GOOSE_ELF: [u8; 200] = [
     0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
     0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x93, 0x08, 0xC0, 0x00, 0x73, 0x00, 0x00, 0x00,
-    0x13, 0x04, 0xE5, 0x03, 0x93, 0x04, 0x20, 0x03, 0x63, 0x84, 0x04, 0x02, 0xB7, 0xC2, 0x00, 0x00,
-    0x93, 0x82, 0x02, 0x35, 0x93, 0x82, 0xF2, 0xFF, 0xE3, 0x9E, 0x02, 0xFE, 0x93, 0x08, 0x00, 0x00,
+    0x13, 0x04, 0xF5, 0x03, 0x93, 0x04, 0x20, 0x03, 0x63, 0x84, 0x04, 0x02, 0xB7, 0x02, 0x10, 0x00,
+    0x93, 0x82, 0x02, 0x00, 0x93, 0x82, 0xF2, 0xFF, 0xE3, 0x9E, 0x02, 0xFE, 0x93, 0x08, 0x00, 0x00,
     0x13, 0x05, 0x04, 0x00, 0x73, 0x00, 0x00, 0x00, 0x93, 0x84, 0xF4, 0xFF, 0x6F, 0xF0, 0xDF, 0xFD,
     0x93, 0x08, 0x00, 0x00, 0x13, 0x05, 0xA0, 0x00, 0x73, 0x00, 0x00, 0x00, 0x93, 0x08, 0x10, 0x00,
     0x13, 0x05, 0x00, 0x00, 0x73, 0x00, 0x00, 0x00,
@@ -139,71 +139,75 @@ _user_init_start:
     # ─── GooseOS init process (PID 1) ───
     # Phase 12: Dining Geese — preemptive scheduling demo.
     #
+    # Spawns 3 goose counters FIRST (so they get PIDs 2,3,4),
+    # then the spinner hog LAST (PID 5). This avoids PID-slot
+    # reuse if the spinner exits before all spawns complete.
+    #
     # Registers:
-    #   s0 = spinner ELF address (0x5F000000)
-    #   s1 = spinner ELF size (148 bytes)
-    #   s2 = goose ELF address (0x5F001000)
-    #   s3 = goose ELF size (184 bytes)
-    #   s4 = spinner PID
-    #   s5 = goose A PID
-    #   s6 = goose B PID
-    #   s7 = goose C PID
+    #   s0 = goose ELF address (0x5F001000)
+    #   s1 = goose ELF size (200 bytes)
+    #   s2 = spinner ELF address (0x5F000000)
+    #   s3 = spinner ELF size (148 bytes)
+    #   s4 = goose A PID
+    #   s5 = goose B PID
+    #   s6 = goose C PID
+    #   s7 = spinner PID
 
-    li      s0, 0x5F000000      # spinner ELF
-    li      s1, 148             # spinner size
-    li      s2, 0x5F001000      # goose ELF
-    li      s3, 200             # goose size
+    li      s0, 0x5F001000      # goose ELF
+    li      s1, 200             # goose size
+    li      s2, 0x5F000000      # spinner ELF
+    li      s3, 148             # spinner size
 
-    # ── Spawn spinner (hog) ──
+    # ── Spawn goose A ──
     li      a7, 10              # SYS_SPAWN
     mv      a0, s0
     mv      a1, s1
     ecall
     li      t0, -1
     beq     a0, t0, .fail
-    mv      s4, a0              # save spinner PID
-
-    # ── Spawn goose A ──
-    li      a7, 10              # SYS_SPAWN
-    mv      a0, s2
-    mv      a1, s3
-    ecall
-    li      t0, -1
-    beq     a0, t0, .fail
-    mv      s5, a0              # save goose A PID
+    mv      s4, a0              # save goose A PID
 
     # ── Spawn goose B ──
     li      a7, 10              # SYS_SPAWN
-    mv      a0, s2
-    mv      a1, s3
+    mv      a0, s0
+    mv      a1, s1
     ecall
     li      t0, -1
     beq     a0, t0, .fail
-    mv      s6, a0              # save goose B PID
+    mv      s5, a0              # save goose B PID
 
     # ── Spawn goose C ──
+    li      a7, 10              # SYS_SPAWN
+    mv      a0, s0
+    mv      a1, s1
+    ecall
+    li      t0, -1
+    beq     a0, t0, .fail
+    mv      s6, a0              # save goose C PID
+
+    # ── Spawn spinner (hog) — last, so it gets the highest PID ──
     li      a7, 10              # SYS_SPAWN
     mv      a0, s2
     mv      a1, s3
     ecall
     li      t0, -1
     beq     a0, t0, .fail
-    mv      s7, a0              # save goose C PID
+    mv      s7, a0              # save spinner PID
 
     # ── Wait for all geese ──
     li      a7, 11              # SYS_WAIT
-    mv      a0, s5              # goose A
+    mv      a0, s4              # goose A
     ecall
     li      a7, 11              # SYS_WAIT
-    mv      a0, s6              # goose B
+    mv      a0, s5              # goose B
     ecall
     li      a7, 11              # SYS_WAIT
-    mv      a0, s7              # goose C
+    mv      a0, s6              # goose C
     ecall
 
     # ── Wait for spinner ──
     li      a7, 11              # SYS_WAIT
-    mv      a0, s4              # spinner
+    mv      a0, s7              # spinner
     ecall
 
     # ── Exit success ──
