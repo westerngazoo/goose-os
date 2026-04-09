@@ -62,6 +62,12 @@ _trap_save:
     # --- Save all general-purpose registers ---
     sd      x1,   0x00(sp)     # ra
 
+    # CRITICAL: Save t0 BEFORE using it as a temp register.
+    # The csrr below will overwrite t0 with the original sp from sscratch.
+    # If we save t0 after the csrr, we lose the user's t0 value — this
+    # corrupts any process preempted while using t0 (e.g., delay loop counter).
+    sd      x5,   0x20(sp)     # t0 — must be saved FIRST
+
     # Save the original sp that was in use BEFORE the trap.
     # After the csrrw swap at entry:
     #   From U-mode: sscratch = user_sp    (the user's stack pointer)
@@ -72,7 +78,7 @@ _trap_save:
 
     sd      x3,   0x10(sp)     # gp
     sd      x4,   0x18(sp)     # tp
-    sd      x5,   0x20(sp)     # t0
+    # x5 (t0) already saved above
     sd      x6,   0x28(sp)     # t1
     sd      x7,   0x30(sp)     # t2
     sd      x8,   0x38(sp)     # s0/fp
