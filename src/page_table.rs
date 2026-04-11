@@ -112,6 +112,14 @@ pub const USER_RW: PteFlags = PteFlags(
     PteFlags::USER.0 | PteFlags::ACCESS.0 | PteFlags::DIRTY.0
 );
 
+/// User MMIO: read + write + user-accessible (for userspace device servers).
+/// Same PTE bits as USER_RW — RISC-V cache control is via PMA, not PTEs.
+/// Separate constant for documentation: these pages map device registers.
+pub const USER_MMIO: PteFlags = PteFlags(
+    PteFlags::VALID.0 | PteFlags::READ.0 | PteFlags::WRITE.0 |
+    PteFlags::USER.0 | PteFlags::ACCESS.0 | PteFlags::DIRTY.0
+);
+
 // ── Page Table Entry ────────────────────────────────────────────
 
 /// A single Sv39 page table entry.

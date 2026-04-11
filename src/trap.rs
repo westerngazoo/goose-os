@@ -26,6 +26,8 @@ pub const SYS_SPAWN: usize = 10;
 pub const SYS_WAIT: usize = 11;
 pub const SYS_GETPID: usize = 12;
 pub const SYS_YIELD: usize = 13;
+pub const SYS_IRQ_REGISTER: usize = 14;
+pub const SYS_IRQ_ACK: usize = 15;
 
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));
@@ -144,7 +146,7 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
     if is_interrupt {
         match code {
             5 => handle_timer(frame),
-            9 => handle_external(),
+            9 => handle_external(frame),
             _ => {
                 println!("\n[trap] unhandled interrupt: code={}", code);
             }
@@ -256,6 +258,14 @@ fn handle_ecall(frame: &mut TrapFrame) {
             crate::process::sys_yield(frame);
             return;
         }
+        SYS_IRQ_REGISTER => {
+            crate::process::sys_irq_register(frame);
+            return;
+        }
+        SYS_IRQ_ACK => {
+            crate::process::sys_irq_ack(frame);
+            return;
+        }
         _ => {
             println!("\n  [kernel] Unknown syscall: {} (a0={:#x})", syscall_num, frame.a0);
             frame.a0 = usize::MAX;
@@ -264,10 +274,26 @@ fn handle_ecall(frame: &mut TrapFrame) {
     }
 }
 
-/// Kernel re-entry point after a user process exits.
+/// Kernel idle loop — entered when no user process is Ready but some are alive.
+///
+/// Executes WFI (Wait For Interrupt) in a loop. When an interrupt fires:
+///   - External IRQ → may wake a blocked process via irq_notify
+///   - Timer → handle_timer calls schedule_from_idle, switching to any Ready process
+///
+/// The key insight: schedule_from_idle overwrites the trap frame with a user
+/// process's context (SPP=0), so sret goes to U-mode. The WFI loop never
+/// resumes — it gets "preempted" by the interrupt handler.
+#[no_mangle]
+pub extern "C" fn kernel_idle() -> ! {
+    loop {
+        unsafe { asm!("wfi"); }
+    }
+}
+
+/// Kernel re-entry point after ALL user processes have exited.
 ///
 /// We land here via sret after SYS_EXIT rewrites the trap frame.
-/// Runs in S-mode with kernel satp. Enters the idle loop.
+/// Runs in S-mode with kernel satp. Enters the interactive idle loop.
 #[no_mangle]
 pub extern "C" fn post_process_exit() -> ! {
     // Disable UART RX interrupts — the idle loop polls directly.
@@ -317,12 +343,31 @@ pub extern "C" fn post_process_exit() -> ! {
 }
 
 /// Handle supervisor external interrupt (from PLIC).
-fn handle_external() {
+///
+/// Phase 13: If a userspace process owns the IRQ, deliver it via IPC
+/// instead of calling the kernel handler. The server must SYS_IRQ_ACK
+/// to complete the PLIC cycle.
+fn handle_external(frame: &mut TrapFrame) {
     let irq = plic::claim();
     if irq == 0 {
         return; // spurious
     }
 
+    // Check if a userspace process owns this IRQ
+    let owner = crate::process::irq_owner(irq);
+    if owner != 0 {
+        // Deliver as IPC notification — don't complete PLIC yet
+        // (server must SYS_IRQ_ACK to re-enable this IRQ)
+        crate::process::irq_notify(irq, owner);
+
+        // If we're in kernel idle (S-mode), schedule the woken process immediately
+        if frame.sstatus & (1 << 8) != 0 {
+            crate::process::schedule_from_idle(frame);
+        }
+        return;
+    }
+
+    // Kernel fallback — no userspace owner
     match irq {
         UART0_IRQ => {
             crate::uart::handle_interrupt();
@@ -354,10 +399,13 @@ fn handle_timer(frame: &mut TrapFrame) {
     let time = read_time();
     sbi_set_timer(time + platform::TIMESLICE);
 
-    // Preempt if we were running a user process.
-    // sstatus.SPP (bit 8) = 0 means we came from U-mode.
+    // Preempt or schedule based on where we came from.
     if frame.sstatus & (1 << 8) == 0 {
+        // From U-mode — preempt current user process (round-robin)
         crate::process::preempt(frame);
+    } else {
+        // From S-mode (kernel idle) — check if any process woke up
+        crate::process::schedule_from_idle(frame);
     }
 }
 
