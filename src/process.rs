@@ -1084,18 +1084,14 @@ pub fn irq_owner(irq: u32) -> usize {
 /// If not: set irq_pending flag — next SYS_RECEIVE returns immediately.
 pub fn irq_notify(irq: u32, owner: usize) {
     unsafe {
-        let state = PROCS[owner].state;
-        println!("[irq_notify] IRQ {} → PID {}, state={:?}", irq, owner, state);
-        if state == ProcessState::BlockedRecv {
+        if PROCS[owner].state == ProcessState::BlockedRecv {
             // Deliver immediately — overwrite the saved context
             PROCS[owner].context.a0 = irq as usize;  // message = IRQ number
             PROCS[owner].context.a1 = 0;              // sender = kernel (PID 0)
             PROCS[owner].state = ProcessState::Ready;
-            println!("[irq_notify] delivered, PID {} now Ready", owner);
         } else {
             // Process not ready to receive — queue for later
             PROCS[owner].irq_pending = true;
-            println!("[irq_notify] PID {} not BlockedRecv, queued", owner);
         }
     }
 }
@@ -1473,25 +1469,7 @@ pub fn sys_exit(frame: &mut TrapFrame) {
                 // Processes exist but none Ready — enter kernel idle.
                 // Timer interrupts will schedule them when they wake.
                 CURRENT_PID = 0;
-
-                // Debug: dump interrupt state so we can see why external IRQs might not fire
-                let sie: usize;
-                let sstatus: usize;
-                asm!("csrr {}, sie", out(reg) sie);
-                asm!("csrr {}, sstatus", out(reg) sstatus);
                 println!("  [kernel] Idle (waiting for events)...");
-                println!("  [debug] sstatus={:#x} sie={:#x} (SEIE={} STIE={})",
-                    sstatus, sie,
-                    if sie & (1 << 9) != 0 { "on" } else { "OFF" },
-                    if sie & (1 << 5) != 0 { "on" } else { "OFF" });
-                for i in 1..MAX_PROCS {
-                    if PROCS[i].state != ProcessState::Free {
-                        println!("  [debug] PID {} state={:?} irq_num={} irq_pending={}",
-                            i, PROCS[i].state, PROCS[i].irq_num, PROCS[i].irq_pending);
-                    }
-                }
-                crate::plic::dump();
-
                 frame.sstatus = (1 << 8) | (1 << 5); // SPP=S, SPIE=1
                 frame.sepc = crate::trap::kernel_idle as *const () as usize;
                 return;

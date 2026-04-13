@@ -374,32 +374,24 @@ pub extern "C" fn post_process_exit() -> ! {
 fn handle_external(frame: &mut TrapFrame) {
     let irq = plic::claim();
     if irq == 0 {
-        println!("[irq] spurious (claim=0)");
-        return;
+        return; // spurious
     }
-
-    println!("[irq] claimed IRQ {}", irq);
 
     // Check if a userspace process owns this IRQ
     let owner = crate::process::irq_owner(irq);
     if owner != 0 {
-        let from_smode = frame.sstatus & (1 << 8) != 0;
-        println!("[irq] owner=PID {}, from_smode={}", owner, from_smode);
-
         // Deliver as IPC notification — don't complete PLIC yet
         // (server must SYS_IRQ_ACK to re-enable this IRQ)
         crate::process::irq_notify(irq, owner);
 
         // If we're in kernel idle (S-mode), schedule the woken process immediately
-        if from_smode {
-            println!("[irq] scheduling from idle");
+        if frame.sstatus & (1 << 8) != 0 {
             crate::process::schedule_from_idle(frame);
         }
         return;
     }
 
     // Kernel fallback — no userspace owner
-    println!("[irq] no owner, kernel fallback");
     match irq {
         UART0_IRQ => {
             crate::uart::handle_interrupt();
