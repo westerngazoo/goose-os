@@ -1041,6 +1041,10 @@ pub fn sys_irq_register(frame: &mut TrapFrame) {
         PROCS[current].irq_num = irq;
     }
 
+    // Enable this IRQ at the PLIC now that a process owns it.
+    // Before this, the PLIC ignores the IRQ even if the device asserts it.
+    crate::plic::enable_irq(irq);
+
     println!("  [kernel] PID {} registered for IRQ {}", current, irq);
     frame.a0 = 0;
 }

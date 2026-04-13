@@ -19,23 +19,36 @@ const THRESHOLD: usize = PLIC_BASE + 0x20_0000 + CONTEXT * 0x1000;
 const CLAIM_COMPLETE: usize = THRESHOLD + 4;
 
 /// Initialize the PLIC for S-mode on the boot hart.
+///
+/// Sets priority and threshold only. Does NOT enable any IRQ yet.
+/// IRQs are enabled individually when a process calls SYS_IRQ_REGISTER.
+/// This prevents IRQ floods before a userspace server owns the interrupt.
 pub fn init() {
     unsafe {
-        // Set UART0 priority = 1
+        // Set UART0 priority = 1 (above threshold → eligible for delivery)
         ptr::write_volatile(priority_addr(UART0_IRQ) as *mut u32, 1);
-
-        // Enable UART0 in our context
-        // IRQ might be > 31, so calculate which enable word and bit
-        let word_index = (UART0_IRQ / 32) as usize;
-        let bit_index = UART0_IRQ % 32;
-        let enable_addr = (ENABLE_BASE + word_index * 4) as *mut u32;
-        ptr::write_volatile(enable_addr, 1 << bit_index);
 
         // Accept all priorities > 0
         ptr::write_volatile(THRESHOLD as *mut u32, 0);
     }
 
-    println!("  [plic] UART0 (IRQ {}) enabled, context={}, threshold=0", UART0_IRQ, CONTEXT);
+    println!("  [plic] UART0 (IRQ {}) priority=1, context={}, threshold=0", UART0_IRQ, CONTEXT);
+    println!("  [plic] IRQ routing deferred until SYS_IRQ_REGISTER");
+}
+
+/// Enable a specific IRQ at the PLIC (set the enable bit).
+///
+/// Called from SYS_IRQ_REGISTER when a process claims an IRQ.
+pub fn enable_irq(irq: u32) {
+    unsafe {
+        let word_index = (irq / 32) as usize;
+        let bit_index = irq % 32;
+        let enable_addr = (ENABLE_BASE + word_index * 4) as *mut u32;
+        // Read-modify-write to preserve other IRQ enable bits
+        let current = ptr::read_volatile(enable_addr as *const u32);
+        ptr::write_volatile(enable_addr, current | (1 << bit_index));
+    }
+    println!("  [plic] IRQ {} enabled at PLIC", irq);
 }
 
 /// Claim the highest-priority pending interrupt.

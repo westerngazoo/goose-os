@@ -97,13 +97,13 @@ mod kernel {
         // === Phase 3: Configure PLIC ===
         plic::init();
 
-        // === Phase 4: UART RX interrupts ===
-        // NOTE: RX interrupts are NOT enabled here. The UART server (PID 2)
-        // enables them AFTER registering for the IRQ via SYS_IRQ_REGISTER.
-        // If we enable them here, the DW8250 on VF2 generates a flood of
-        // level-triggered IRQs before any process owns them, starving the
-        // scheduler — no process ever runs.
-        println!("  [uart] RX interrupts deferred to UART server");
+        // === Phase 4: Enable UART RX interrupts on the chip ===
+        // The UART chip will assert IRQ when data arrives, but the PLIC
+        // does NOT route it yet — plic::init() only sets priority/threshold.
+        // The PLIC enable bit is set later when PID 2 calls SYS_IRQ_REGISTER.
+        // This prevents an IRQ flood before any process owns the interrupt.
+        uart.enable_rx_interrupt();
+        println!("  [uart] RX interrupts enabled (PLIC routing deferred)");
 
         // === Phase 5: Arm the timer ===
         trap::timer_init();
