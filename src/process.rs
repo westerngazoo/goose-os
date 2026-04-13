@@ -1084,14 +1084,18 @@ pub fn irq_owner(irq: u32) -> usize {
 /// If not: set irq_pending flag — next SYS_RECEIVE returns immediately.
 pub fn irq_notify(irq: u32, owner: usize) {
     unsafe {
-        if PROCS[owner].state == ProcessState::BlockedRecv {
+        let state = PROCS[owner].state;
+        println!("[irq_notify] IRQ {} → PID {}, state={:?}", irq, owner, state);
+        if state == ProcessState::BlockedRecv {
             // Deliver immediately — overwrite the saved context
             PROCS[owner].context.a0 = irq as usize;  // message = IRQ number
             PROCS[owner].context.a1 = 0;              // sender = kernel (PID 0)
             PROCS[owner].state = ProcessState::Ready;
+            println!("[irq_notify] delivered, PID {} now Ready", owner);
         } else {
             // Process not ready to receive — queue for later
             PROCS[owner].irq_pending = true;
+            println!("[irq_notify] PID {} not BlockedRecv, queued", owner);
         }
     }
 }
