@@ -59,14 +59,25 @@ pub const BOOT_HART: usize = 1;
 
 /// PLIC context for S-mode on the boot hart.
 ///
-/// PLIC contexts: each hart gets 2 contexts (M-mode=even, S-mode=odd).
-/// QEMU: hart 0 → context 0 (M), context 1 (S) → we use context 1
-/// VF2:  hart 1 → context 2 (M), context 3 (S) → we use context 3
+/// PLIC contexts are assigned sequentially to each (hart, mode) pair.
+/// The S7 monitor core (hart 0) has NO S-mode, so it only gets ONE context,
+/// which shifts all subsequent context numbers down by one.
+///
+/// QEMU virt (all harts have M+S, 2 contexts each):
+///   Context 0: hart 0 M-mode
+///   Context 1: hart 0 S-mode  ← we use this
+///
+/// VisionFive 2 / JH7110 (hart 0 = S7 M-only, harts 1-4 = U74 M+S):
+///   Context 0: hart 0 M-mode (S7, no S-mode → only 1 context)
+///   Context 1: hart 1 M-mode
+///   Context 2: hart 1 S-mode  ← we use this
+///   Context 3: hart 2 M-mode
+///   ...
 #[cfg(feature = "qemu")]
 pub const PLIC_S_CONTEXT: usize = 1;
 
 #[cfg(feature = "vf2")]
-pub const PLIC_S_CONTEXT: usize = 3;
+pub const PLIC_S_CONTEXT: usize = 2;
 
 // ──────────────────────────────────────────
 // Timer
