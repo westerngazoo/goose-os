@@ -285,6 +285,13 @@ pub fn launch() -> ! {
     let uart_start = unsafe { &_uart_server_start as *const u8 as usize };
     let uart_size = unsafe { &_uart_server_end as *const u8 as usize } - uart_start;
 
+    // Disable interrupts while creating processes.
+    // Without this, a timer interrupt after PID 1 is created (state=Ready)
+    // could call schedule_from_idle() and switch to PID 1 BEFORE PID 2 exists.
+    // PID 1 would then SYS_CALL(2, char) to a nonexistent PID and block forever.
+    // This race was observed on VF2 where serial output is slower than QEMU.
+    unsafe { asm!("csrc sstatus, {}", in(reg) 1usize << 1); }
+
     println!("  [proc] Creating init (PID 1)...");
     create_process(1, init_start, init_size);
 
@@ -317,6 +324,13 @@ pub fn launch() -> ! {
     let entry = proc1.context.sepc;
     let user_sp = proc1.context.sp;
     let satp = proc1.satp;
+
+    // NOTE: Do NOT re-enable SIE here. We disabled interrupts (cleared SIE)
+    // before creating processes. The sret below sets SPIE, and sret copies
+    // SPIE→SIE — so interrupts are automatically re-enabled when we enter
+    // U-mode. Re-enabling SIE before sret would allow a timer interrupt to
+    // fire while still in S-mode, calling schedule_from_idle() and preempting
+    // the launch sequence. This race was observed on VF2 build 48.
 
     println!("  [proc] Launching PID 1 (init)...");
     println!();
