@@ -56,7 +56,7 @@ mod kernel {
     ///   FID = 0
     ///   a0  = reset_type  (0=shutdown, 1=cold reboot, 2=warm reboot)
     ///   a1  = reset_reason (0=no reason, 1=system failure)
-    fn sbi_system_reset() -> ! {
+    pub fn sbi_system_reset() -> ! {
         unsafe {
             asm!(
                 "ecall",

@@ -28,6 +28,7 @@ pub const SYS_GETPID: usize = 12;
 pub const SYS_YIELD: usize = 13;
 pub const SYS_IRQ_REGISTER: usize = 14;
 pub const SYS_IRQ_ACK: usize = 15;
+pub const SYS_REBOOT: usize = 16;
 
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));
@@ -292,6 +293,10 @@ fn handle_ecall(frame: &mut TrapFrame) {
             crate::process::sys_irq_ack(frame);
             return;
         }
+        SYS_REBOOT => {
+            println!("\n  [kernel] SYS_REBOOT — rebooting...");
+            crate::kernel::sbi_system_reset();
+        }
         _ => {
             println!("\n  [kernel] Unknown syscall: {} (a0={:#x})", syscall_num, frame.a0);
             frame.a0 = usize::MAX;
@@ -341,17 +346,7 @@ pub extern "C" fn post_process_exit() -> ! {
             match c {
                 0x12 | b'R' => {
                     println!("\n  Rebooting...");
-                    // SBI System Reset
-                    unsafe {
-                        asm!(
-                            "ecall",
-                            in("a0") 1usize,
-                            in("a1") 0usize,
-                            in("a6") 0usize,
-                            in("a7") 0x53525354usize,
-                            options(noreturn)
-                        );
-                    }
+                    crate::kernel::sbi_system_reset();
                 }
                 b'\r' | b'\n' => { uart.putc(b'\r'); uart.putc(b'\n'); }
                 0x7F | 0x08 => { uart.putc(0x08); uart.putc(b' '); uart.putc(0x08); }

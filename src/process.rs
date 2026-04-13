@@ -350,6 +350,30 @@ _uart_server_start:
 
     lbu     s2, 0(s0)           # read char from RBR
 
+    # Ctrl-R (0x12) → print message then reboot
+    li      t1, 0x12
+    bne     s2, t1, .uart_not_reboot
+
+    # Server-side UX: print what we received before kernel resets
+    # Pattern: pre-syscall notification — server owns the UX, kernel owns the action
+.uart_reboot_msg:
+    la      t2, .uart_reboot_str
+.uart_reboot_putc:
+    lbu     t3, 0(t2)
+    beqz    t3, .uart_reboot_go
+.uart_reboot_thr_wait:
+    lbu     t0, UART_LSR_OFF(s0)
+    andi    t0, t0, 0x20        # THR empty?
+    beqz    t0, .uart_reboot_thr_wait
+    sb      t3, 0(s0)
+    addi    t2, t2, 1
+    j       .uart_reboot_putc
+.uart_reboot_go:
+    li      a7, 16              # SYS_REBOOT
+    ecall
+
+.uart_not_reboot:
+
     # Echo the char back
 .uart_echo_wait:
     lbu     t0, UART_LSR_OFF(s0)
@@ -376,6 +400,11 @@ _uart_server_start:
     ecall
 
     j       .uart_server_loop
+
+    # ── String data (inlined in .text to stay within the server's mapped pages) ──
+    .balign 4
+.uart_reboot_str:
+    .asciz "\r\n  [Ctrl-R] Rebooting...\r\n"
 
 _uart_server_end:
 "#);
