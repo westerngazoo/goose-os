@@ -47,3 +47,18 @@ pub fn claim() -> u32 {
 pub fn complete(irq: u32) {
     unsafe { ptr::write_volatile(CLAIM_COMPLETE as *mut u32, irq); }
 }
+
+/// Dump PLIC state for debugging.
+pub fn dump() {
+    unsafe {
+        let pri = ptr::read_volatile(priority_addr(UART0_IRQ) as *const u32);
+        let word_index = (UART0_IRQ / 32) as usize;
+        let enable_addr = (ENABLE_BASE + word_index * 4) as *const u32;
+        let en = ptr::read_volatile(enable_addr);
+        let thr = ptr::read_volatile(THRESHOLD as *const u32);
+        let pending_addr = (PLIC_BASE + 0x1000 + word_index * 4) as *const u32;
+        let pend = ptr::read_volatile(pending_addr);
+        println!("  [plic] IRQ {} priority={} enable_word[{}]={:#010x} threshold={} pending={:#010x}",
+            UART0_IRQ, pri, word_index, en, thr, pend);
+    }
+}

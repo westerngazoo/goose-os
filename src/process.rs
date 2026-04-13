@@ -1473,7 +1473,25 @@ pub fn sys_exit(frame: &mut TrapFrame) {
                 // Processes exist but none Ready — enter kernel idle.
                 // Timer interrupts will schedule them when they wake.
                 CURRENT_PID = 0;
+
+                // Debug: dump interrupt state so we can see why external IRQs might not fire
+                let sie: usize;
+                let sstatus: usize;
+                asm!("csrr {}, sie", out(reg) sie);
+                asm!("csrr {}, sstatus", out(reg) sstatus);
                 println!("  [kernel] Idle (waiting for events)...");
+                println!("  [debug] sstatus={:#x} sie={:#x} (SEIE={} STIE={})",
+                    sstatus, sie,
+                    if sie & (1 << 9) != 0 { "on" } else { "OFF" },
+                    if sie & (1 << 5) != 0 { "on" } else { "OFF" });
+                for i in 1..MAX_PROCS {
+                    if PROCS[i].state != ProcessState::Free {
+                        println!("  [debug] PID {} state={:?} irq_num={} irq_pending={}",
+                            i, PROCS[i].state, PROCS[i].irq_num, PROCS[i].irq_pending);
+                    }
+                }
+                crate::plic::dump();
+
                 frame.sstatus = (1 << 8) | (1 << 5); // SPP=S, SPIE=1
                 frame.sepc = crate::trap::kernel_idle as *const () as usize;
                 return;
