@@ -29,6 +29,8 @@ mod process;
 mod elf;
 #[allow(dead_code)]
 mod wasm;
+#[allow(dead_code)]
+mod interp;
 
 
 // ── Kernel code (only compiled for RISC-V target, not during host tests) ──
