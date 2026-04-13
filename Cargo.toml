@@ -8,6 +8,7 @@ default = ["qemu"]
 qemu = []
 vf2 = []
 security-test = ["qemu"]  # Boots security test process instead of normal init
+debug-kernel = []          # Enable kdebug!/kdump macros (verbose kernel tracing)
 
 [profile.dev]
 panic = "abort"

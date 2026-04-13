@@ -22,7 +22,7 @@ use crate::page_alloc::PAGE_SIZE;
 use crate::page_table::*;
 use crate::trap::TrapFrame;
 use crate::kvm;
-use crate::println;
+use crate::{println, kdebug, kdump_csrs, kdump_plic, kdump_procs};
 
 // ── Constants ──────────────────────────────────────────────────
 
@@ -93,6 +93,26 @@ static mut IRQ_OWNER: [usize; MAX_IRQS] = [0; MAX_IRQS];
 /// Get the currently running PID (for trap handler diagnostics).
 pub fn current_pid() -> usize {
     unsafe { CURRENT_PID }
+}
+
+/// Dump all non-Free process slots. Called by kdump_procs! macro.
+///
+/// Always compiled (body is empty without `debug-kernel` feature).
+/// The macro already gates the call site — putting #[cfg] on the function
+/// itself triggered a rustc nightly ICE in lint_mod/check_mod_deathness.
+#[allow(dead_code)]
+pub fn dump_procs() {
+    #[cfg(feature = "debug-kernel")]
+    unsafe {
+        println!("[procs] CURRENT_PID={}", CURRENT_PID);
+        for i in 1..MAX_PROCS {
+            if PROCS[i].state != ProcessState::Free {
+                println!("[procs] PID {} state={:?} irq={} irq_pending={} ipc_target={} sepc={:#x}",
+                    i, PROCS[i].state, PROCS[i].irq_num, PROCS[i].irq_pending,
+                    PROCS[i].ipc_target, PROCS[i].context.sepc);
+            }
+        }
+    }
 }
 
 /// Kill the currently running process due to an unrecoverable fault.
@@ -1474,6 +1494,9 @@ pub fn sys_exit(frame: &mut TrapFrame) {
                 // Timer interrupts will schedule them when they wake.
                 CURRENT_PID = 0;
                 println!("  [kernel] Idle (waiting for events)...");
+                kdump_csrs!();
+                kdump_procs!();
+                kdump_plic!();
                 frame.sstatus = (1 << 8) | (1 << 5); // SPP=S, SPIE=1
                 frame.sepc = crate::trap::kernel_idle as *const () as usize;
                 return;

@@ -6,6 +6,10 @@
 // When building for RISC-V, use no_std/no_main.
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
+// Workaround: rustc nightly ICE on dead_code lint analysis in process module.
+// https://github.com/rust-lang/rust/issues/ — crashes in lint_mod/check_mod_deathness.
+// Also moved #[cfg(feature)] from fn dump_procs item to inner body to avoid the ICE.
+#![allow(dead_code)]
 
 #[cfg(not(test))]
 mod console;

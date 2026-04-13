@@ -40,6 +40,30 @@ debug: build
 objdump: build
 	rust-objdump -d $(KERNEL_ELF) | head -80
 
+# Debug kernel: enables kdebug!/kdump macros for verbose tracing.
+run-debug:
+	GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features debug-kernel
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	@echo ">>> Debug kernel — kdebug/kdump macros active"
+	$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL_ELF)
+
+test-debug:
+	GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features debug-kernel
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	timeout 5 $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL_ELF) || true
+
+# Deploy debug kernel to VF2
+deploy-debug:
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	GOOSE_BUILD=$(NEXT_BUILD) RUSTFLAGS="-C link-arg=-Tlinker-vf2.ld" \
+	  cargo build --release --features "vf2 debug-kernel" --no-default-features
+	$(OBJCOPY) -O binary $(KERNEL_ELF) kernel.bin
+	@ls -lh kernel.bin
+	git add kernel.bin src/ Makefile Cargo.toml linker.ld linker-vf2.ld .build_number goose-upgrade.sh
+	git commit -m "Build $(NEXT_BUILD) (debug)" --allow-empty || true
+	git push
+	@echo ">>> DEPLOYED debug kernel build $(NEXT_BUILD)"
+
 # Security test: boots a malicious process that tests all attack vectors.
 # Expected output: P1..P8 (pass), K9 (attempt), then "Process fault" + kill.
 # Any "F<n>" or "!!!" in the output means a security check is broken.

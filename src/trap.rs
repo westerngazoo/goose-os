@@ -9,7 +9,7 @@
 /// happened and dispatch accordingly.
 
 use core::arch::{asm, global_asm};
-use crate::{plic, platform, println};
+use crate::{plic, platform, println, kdebug, kdump_csrs};
 
 /// Syscall numbers — must match userspace programs.
 pub const SYS_PUTCHAR: usize = 0;
@@ -149,6 +149,7 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
             9 => handle_external(frame),
             _ => {
                 println!("\n[trap] unhandled interrupt: code={}", code);
+                kdump_csrs!();
             }
         }
     } else {
@@ -156,6 +157,7 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
         match code {
             8 => {
                 // ecall from U-mode — handle syscall
+                kdebug!("ecall: a7={} a0={:#x} a1={:#x}", frame.a7, frame.a0, frame.a1);
                 handle_ecall(frame);
             }
             _ => {
@@ -374,11 +376,13 @@ pub extern "C" fn post_process_exit() -> ! {
 fn handle_external(frame: &mut TrapFrame) {
     let irq = plic::claim();
     if irq == 0 {
-        return; // spurious
+        kdebug!("external: spurious (claim=0)");
+        return;
     }
 
     // Check if a userspace process owns this IRQ
     let owner = crate::process::irq_owner(irq);
+    kdebug!("external: IRQ {} owner={}", irq, owner);
     if owner != 0 {
         // Deliver as IPC notification — don't complete PLIC yet
         // (server must SYS_IRQ_ACK to re-enable this IRQ)
@@ -386,12 +390,14 @@ fn handle_external(frame: &mut TrapFrame) {
 
         // If we're in kernel idle (S-mode), schedule the woken process immediately
         if frame.sstatus & (1 << 8) != 0 {
+            kdebug!("external: scheduling from idle");
             crate::process::schedule_from_idle(frame);
         }
         return;
     }
 
     // Kernel fallback — no userspace owner
+    kdebug!("external: no owner, kernel fallback for IRQ {}", irq);
     match irq {
         UART0_IRQ => {
             crate::uart::handle_interrupt();
