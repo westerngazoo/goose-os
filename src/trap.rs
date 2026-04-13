@@ -159,7 +159,6 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
                 handle_ecall(frame);
             }
             _ => {
-                // Unexpected exception — print diagnostics and panic
                 let cause_name = match code {
                     0 => "instruction address misaligned",
                     1 => "instruction access fault",
@@ -175,12 +174,37 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
                     15 => "store/AMO page fault",
                     _ => "unknown",
                 };
-                println!("\n!!! EXCEPTION !!!");
-                println!("  cause:  {} (code={})", cause_name, code);
-                println!("  stval:  {:#018x}", stval);
-                println!("  sepc:   {:#018x}", frame.sepc);
-                println!("  ra:     {:#018x}", frame.ra);
-                panic!("unrecoverable exception");
+
+                // Check SPP bit: did this fault come from U-mode or S-mode?
+                let from_user = frame.sstatus & (1 << 8) == 0;
+
+                if from_user {
+                    // ── U-mode fault: kill the process, don't crash the kernel ──
+                    //
+                    // This is the correct behavior for a microkernel. A user
+                    // process accessing unmapped memory, executing an illegal
+                    // instruction, or hitting any other fault should be killed —
+                    // not bring down the entire system.
+                    let pid = crate::process::current_pid();
+                    println!();
+                    println!("  [kernel] Process fault:");
+                    println!("    PID:    {}", pid);
+                    println!("    cause:  {} (code={})", cause_name, code);
+                    println!("    stval:  {:#018x}", stval);
+                    println!("    sepc:   {:#018x}", frame.sepc);
+                    crate::process::kill_current(frame, 128 + code);
+                } else {
+                    // ── S-mode fault: kernel bug, panic ──
+                    //
+                    // If the kernel itself faults, something is deeply wrong.
+                    // Print diagnostics and halt.
+                    println!("\n!!! KERNEL EXCEPTION !!!");
+                    println!("  cause:  {} (code={})", cause_name, code);
+                    println!("  stval:  {:#018x}", stval);
+                    println!("  sepc:   {:#018x}", frame.sepc);
+                    println!("  ra:     {:#018x}", frame.ra);
+                    panic!("unrecoverable kernel exception");
+                }
             }
         }
     }

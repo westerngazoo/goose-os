@@ -40,6 +40,14 @@ debug: build
 objdump: build
 	rust-objdump -d $(KERNEL_ELF) | head -80
 
+# Security test: boots a malicious process that tests all attack vectors.
+# Expected output: P1..P8 (pass), K9 (attempt), then "Process fault" + kill.
+# Any "F<n>" or "!!!" in the output means a security check is broken.
+test-security:
+	GOOSE_BUILD=sec cargo build --release --features security-test --no-default-features
+	@echo "=== Security Test ==="
+	timeout 5 $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL_ELF) || true
+
 # ── VisionFive 2 ────────────────────────────────────────────
 
 build-vf2:

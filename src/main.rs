@@ -28,6 +28,8 @@ mod process;
 #[cfg(not(test))]
 mod elf;
 #[allow(dead_code)]
+mod security;
+#[allow(dead_code)]
 mod wasm;
 #[allow(dead_code)]
 mod interp;

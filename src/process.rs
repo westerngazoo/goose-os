@@ -90,7 +90,104 @@ static mut CURRENT_PID: usize = 0;
 /// IRQ ownership table — maps IRQ number to owning PID (0 = kernel/unclaimed).
 static mut IRQ_OWNER: [usize; MAX_IRQS] = [0; MAX_IRQS];
 
-// ── ELF Binaries removed — Phase 13 uses only embedded assembly ──
+/// Get the currently running PID (for trap handler diagnostics).
+pub fn current_pid() -> usize {
+    unsafe { CURRENT_PID }
+}
+
+/// Kill the currently running process due to an unrecoverable fault.
+///
+/// Called by the trap handler when a U-mode exception occurs (page fault,
+/// illegal instruction, etc.). This is the microkernel equivalent of
+/// Linux's SIGSEGV + process termination.
+///
+/// `exit_code` follows Unix convention: 128 + signal number (here, scause code).
+pub fn kill_current(frame: &mut TrapFrame, exit_code: usize) {
+    let current = unsafe { CURRENT_PID };
+    if current == 0 {
+        panic!("kill_current called with no running process");
+    }
+
+    println!("  [kernel] PID {} killed (exit code {})", current, exit_code);
+
+    unsafe {
+        PROCS[current].state = ProcessState::Free;
+        PROCS[current].exit_code = exit_code;
+
+        // Clean up IRQ ownership
+        if PROCS[current].irq_num != 0 {
+            let irq = PROCS[current].irq_num;
+            if (irq as usize) < MAX_IRQS {
+                IRQ_OWNER[irq as usize] = 0;
+            }
+            PROCS[current].irq_num = 0;
+        }
+
+        // Wake any parent that's BlockedWait on us
+        for i in 1..MAX_PROCS {
+            if PROCS[i].state == ProcessState::BlockedWait
+                && PROCS[i].ipc_target == current
+            {
+                PROCS[i].context.a0 = exit_code;
+                PROCS[i].state = ProcessState::Ready;
+                break;
+            }
+        }
+
+        // Find next ready process
+        let mut next = 0;
+        for i in 1..MAX_PROCS {
+            if PROCS[i].state == ProcessState::Ready {
+                next = i;
+                break;
+            }
+        }
+
+        if next == 0 {
+            // Check if any processes are still alive
+            let mut any_alive = false;
+            for i in 1..MAX_PROCS {
+                if PROCS[i].state != ProcessState::Free {
+                    any_alive = true;
+                    break;
+                }
+            }
+
+            let kernel_satp = crate::kvm::kernel_satp();
+            asm!(
+                "csrw satp, {0}",
+                "sfence.vma zero, zero",
+                in(reg) kernel_satp,
+            );
+
+            if any_alive {
+                CURRENT_PID = 0;
+                println!("  [kernel] Idle (waiting for events)...");
+                frame.sstatus = (1 << 8) | (1 << 5);
+                frame.sepc = crate::trap::kernel_idle as *const () as usize;
+                return;
+            }
+
+            CURRENT_PID = 0;
+            println!("  [kernel] All processes finished.");
+            frame.sstatus = (1 << 8) | (1 << 5);
+            frame.sepc = crate::trap::post_process_exit as *const () as usize;
+            return;
+        }
+
+        // Switch to next process
+        *frame = PROCS[next].context;
+        PROCS[next].state = ProcessState::Running;
+        CURRENT_PID = next;
+
+        let next_satp = PROCS[next].satp;
+        asm!(
+            "csrw satp, {0}",
+            "sfence.vma zero, zero",
+            in(reg) next_satp,
+        );
+    }
+}
 
 // ── Embedded User Programs ─────────────────────────────────────
 
@@ -263,28 +360,279 @@ _uart_server_start:
 _uart_server_end:
 "#);
 
+// ── Security Test Process (conditional) ───────────────────────
+//
+// Embedded assembly that tests kernel security boundaries from U-mode.
+// Only compiled when the `security-test` feature is enabled.
+//
+// Tests:
+//   T1: Unknown syscall → returns error
+//   T2: SYS_MAP with kernel VA → returns error
+//   T3: SYS_UNMAP with kernel VA → returns error
+//   T4: SYS_SEND to PID 0 (kernel) → returns error
+//   T5: SYS_SEND to self → returns error
+//   T6: SYS_MAP with unaligned address → returns error
+//   T7: SYS_FREE_PAGES on kernel address → returns error
+//   T8: SYS_SEND to out-of-bounds PID → returns error
+//   T9: Read kernel memory → page fault → process killed
+//
+// Prints "P<n>" for pass, "F<n>" for fail. Final test triggers a kill.
+
+#[cfg(feature = "security-test")]
+global_asm!(r#"
+.section .text
+.balign 4
+.global _security_test_start
+.global _security_test_end
+
+_security_test_start:
+    # ─── GooseOS Security Test Process ───
+    #
+    # Each test does a syscall that should be rejected, checks a0 == -1,
+    # and prints P<n> (pass) or F<n> (fail) via SYS_PUTCHAR.
+    #
+    # Final test reads kernel memory — should trigger page fault and kill.
+
+    # ── T1: Unknown syscall number → error ──
+    li      a7, 255
+    li      a0, 0
+    ecall
+    li      t0, -1
+    bne     a0, t0, .t1_fail
+    li      a7, 0
+    li      a0, 0x50            # 'P'
+    ecall
+    j       .t1_done
+.t1_fail:
+    li      a7, 0
+    li      a0, 0x46            # 'F'
+    ecall
+.t1_done:
+    li      a7, 0
+    li      a0, 0x31            # '1'
+    ecall
+    li      a7, 0
+    li      a0, 10              # '\n'
+    ecall
+
+    # ── T2: SYS_MAP with kernel VA → error ──
+    li      a7, 6               # SYS_MAP
+    li      a0, 0x80200000      # phys = kernel text
+    li      a1, 0x80200000      # virt = kernel VA (out of user range)
+    li      a2, 0
+    ecall
+    li      t0, -1
+    bne     a0, t0, .t2_fail
+    li      a7, 0
+    li      a0, 0x50
+    ecall
+    j       .t2_done
+.t2_fail:
+    li      a7, 0
+    li      a0, 0x46
+    ecall
+.t2_done:
+    li      a7, 0
+    li      a0, 0x32            # '2'
+    ecall
+    li      a7, 0
+    li      a0, 10
+    ecall
+
+    # ── T3: SYS_UNMAP kernel VA → error ──
+    li      a7, 7               # SYS_UNMAP
+    li      a0, 0x80200000      # kernel text page
+    ecall
+    li      t0, -1
+    bne     a0, t0, .t3_fail
+    li      a7, 0
+    li      a0, 0x50
+    ecall
+    j       .t3_done
+.t3_fail:
+    li      a7, 0
+    li      a0, 0x46
+    ecall
+.t3_done:
+    li      a7, 0
+    li      a0, 0x33            # '3'
+    ecall
+    li      a7, 0
+    li      a0, 10
+    ecall
+
+    # ── T4: SYS_SEND to PID 0 (kernel) → error ──
+    li      a7, 2               # SYS_SEND
+    li      a0, 0               # target = kernel
+    li      a1, 0xDEAD
+    ecall
+    li      t0, -1
+    bne     a0, t0, .t4_fail
+    li      a7, 0
+    li      a0, 0x50
+    ecall
+    j       .t4_done
+.t4_fail:
+    li      a7, 0
+    li      a0, 0x46
+    ecall
+.t4_done:
+    li      a7, 0
+    li      a0, 0x34            # '4'
+    ecall
+    li      a7, 0
+    li      a0, 10
+    ecall
+
+    # ── T5: SYS_SEND to self → error ──
+    li      a7, 12              # SYS_GETPID
+    ecall
+    mv      s0, a0              # s0 = my PID
+
+    li      a7, 2               # SYS_SEND
+    mv      a0, s0              # target = self
+    li      a1, 0xDEAD
+    ecall
+    li      t0, -1
+    bne     a0, t0, .t5_fail
+    li      a7, 0
+    li      a0, 0x50
+    ecall
+    j       .t5_done
+.t5_fail:
+    li      a7, 0
+    li      a0, 0x46
+    ecall
+.t5_done:
+    li      a7, 0
+    li      a0, 0x35            # '5'
+    ecall
+    li      a7, 0
+    li      a0, 10
+    ecall
+
+    # ── T6: SYS_MAP with unaligned phys → error ──
+    li      a7, 6               # SYS_MAP
+    li      a0, 0x5E000001      # unaligned phys
+    li      a1, 0x5E001000      # valid user VA
+    li      a2, 0
+    ecall
+    li      t0, -1
+    bne     a0, t0, .t6_fail
+    li      a7, 0
+    li      a0, 0x50
+    ecall
+    j       .t6_done
+.t6_fail:
+    li      a7, 0
+    li      a0, 0x46
+    ecall
+.t6_done:
+    li      a7, 0
+    li      a0, 0x36            # '6'
+    ecall
+    li      a7, 0
+    li      a0, 10
+    ecall
+
+    # ── T7: SYS_FREE_PAGES on kernel address → error ──
+    li      a7, 9               # SYS_FREE_PAGES
+    li      a0, 0x80200000      # kernel text
+    li      a1, 1
+    ecall
+    li      t0, -1
+    bne     a0, t0, .t7_fail
+    li      a7, 0
+    li      a0, 0x50
+    ecall
+    j       .t7_done
+.t7_fail:
+    li      a7, 0
+    li      a0, 0x46
+    ecall
+.t7_done:
+    li      a7, 0
+    li      a0, 0x37            # '7'
+    ecall
+    li      a7, 0
+    li      a0, 10
+    ecall
+
+    # ── T8: SYS_SEND to PID 99 → error (out of bounds) ──
+    li      a7, 2               # SYS_SEND
+    li      a0, 99              # PID 99 — way beyond MAX_PROCS
+    li      a1, 0xDEAD
+    ecall
+    li      t0, -1
+    bne     a0, t0, .t8_fail
+    li      a7, 0
+    li      a0, 0x50
+    ecall
+    j       .t8_done
+.t8_fail:
+    li      a7, 0
+    li      a0, 0x46
+    ecall
+.t8_done:
+    li      a7, 0
+    li      a0, 0x38            # '8'
+    ecall
+    li      a7, 0
+    li      a0, 10
+    ecall
+
+    # ── T9: Read kernel memory → page fault → should be killed ──
+    # Print "K9" before the attempt so we know we got here
+    li      a7, 0
+    li      a0, 0x4B            # 'K'
+    ecall
+    li      a7, 0
+    li      a0, 0x39            # '9'
+    ecall
+    li      a7, 0
+    li      a0, 10
+    ecall
+
+    # This load MUST fault. Kernel .text at 0x80200000 has no U bit.
+    # If this succeeds, the kernel's page table isolation is broken.
+    li      t0, 0x80200000
+    lw      t1, 0(t0)
+
+    # ── IF WE REACH HERE, THE KERNEL IS BROKEN ──
+    # Print "!!!" as a distress signal
+    li      a7, 0
+    li      a0, 0x21            # '!'
+    ecall
+    li      a7, 0
+    li      a0, 0x21
+    ecall
+    li      a7, 0
+    li      a0, 0x21
+    ecall
+    li      a7, 0
+    li      a0, 10
+    ecall
+
+    li      a7, 1               # SYS_EXIT
+    li      a0, 99              # exit code 99 = security failure
+    ecall
+1:  j       1b
+
+_security_test_end:
+"#);
+
 // ── Boot: Create Processes and Launch ──────────────────────────
 
-/// Create init and UART server, then launch.
+/// Create processes and launch.
 ///
-/// Phase 13: Two kernel-created processes:
+/// Normal mode (default): Two kernel-created processes:
 ///   PID 1 = init — sends greeting via IPC to UART server, exits
 ///   PID 2 = UART server — handles TX (via IPC) and RX (via IRQ)
 ///
-/// UART MMIO is identity-mapped into PID 2's address space.
+/// Security test mode (`--features security-test`): One process:
+///   PID 1 = security test — exercises all attack vectors, then
+///   deliberately reads kernel memory to verify page fault kills it.
 pub fn launch() -> ! {
-    extern "C" {
-        static _user_init_start: u8;
-        static _user_init_end: u8;
-        static _uart_server_start: u8;
-        static _uart_server_end: u8;
-    }
-
-    let init_start = unsafe { &_user_init_start as *const u8 as usize };
-    let init_size = unsafe { &_user_init_end as *const u8 as usize } - init_start;
-    let uart_start = unsafe { &_uart_server_start as *const u8 as usize };
-    let uart_size = unsafe { &_uart_server_end as *const u8 as usize } - uart_start;
-
     // Disable interrupts while creating processes.
     // Without this, a timer interrupt after PID 1 is created (state=Ready)
     // could call schedule_from_idle() and switch to PID 1 BEFORE PID 2 exists.
@@ -292,21 +640,50 @@ pub fn launch() -> ! {
     // This race was observed on VF2 where serial output is slower than QEMU.
     unsafe { asm!("csrc sstatus, {}", in(reg) 1usize << 1); }
 
-    println!("  [proc] Creating init (PID 1)...");
-    create_process(1, init_start, init_size);
+    #[cfg(feature = "security-test")]
+    {
+        extern "C" {
+            static _security_test_start: u8;
+            static _security_test_end: u8;
+        }
+        let test_start = unsafe { &_security_test_start as *const u8 as usize };
+        let test_size = unsafe { &_security_test_end as *const u8 as usize } - test_start;
 
-    println!("  [proc] Creating UART server (PID 2)...");
-    create_process(2, uart_start, uart_size);
+        println!("  [security] === SECURITY TEST MODE ===");
+        println!("  [security] Creating security test (PID 1)...");
+        create_process(1, test_start, test_size);
+    }
 
-    // Map UART MMIO into PID 2's address space at a USER-accessible VA.
-    // We can't reuse VA 0x10000000 because map_kernel_regions already maps it
-    // with KERNEL_MMIO (no U bit) — overwriting that would block kernel println!.
-    // Instead, map the UART physical address at a separate user VA.
-    const UART_USER_VA: usize = 0x5E00_0000;
-    let root2 = kvm::satp_to_root(unsafe { PROCS[2].satp });
-    kvm::map_user_page(root2, UART_USER_VA, crate::platform::UART_BASE, USER_MMIO);
-    println!("  [proc] Mapped UART MMIO PA {:#x} at user VA {:#x} into PID 2",
-        crate::platform::UART_BASE, UART_USER_VA);
+    #[cfg(not(feature = "security-test"))]
+    {
+        extern "C" {
+            static _user_init_start: u8;
+            static _user_init_end: u8;
+            static _uart_server_start: u8;
+            static _uart_server_end: u8;
+        }
+
+        let init_start = unsafe { &_user_init_start as *const u8 as usize };
+        let init_size = unsafe { &_user_init_end as *const u8 as usize } - init_start;
+        let uart_start = unsafe { &_uart_server_start as *const u8 as usize };
+        let uart_size = unsafe { &_uart_server_end as *const u8 as usize } - uart_start;
+
+        println!("  [proc] Creating init (PID 1)...");
+        create_process(1, init_start, init_size);
+
+        println!("  [proc] Creating UART server (PID 2)...");
+        create_process(2, uart_start, uart_size);
+
+        // Map UART MMIO into PID 2's address space at a USER-accessible VA.
+        // We can't reuse VA 0x10000000 because map_kernel_regions already maps it
+        // with KERNEL_MMIO (no U bit) — overwriting that would block kernel println!.
+        // Instead, map the UART physical address at a separate user VA.
+        const UART_USER_VA: usize = 0x5E00_0000;
+        let root2 = kvm::satp_to_root(unsafe { PROCS[2].satp });
+        kvm::map_user_page(root2, UART_USER_VA, crate::platform::UART_BASE, USER_MMIO);
+        println!("  [proc] Mapped UART MMIO PA {:#x} at user VA {:#x} into PID 2",
+            crate::platform::UART_BASE, UART_USER_VA);
+    }
 
     let alloc = unsafe { crate::page_alloc::get() };
     println!();
@@ -533,6 +910,14 @@ pub fn sys_unmap(frame: &mut TrapFrame) {
         return;
     }
 
+    // SECURITY: Only allow unmapping user-range VAs.
+    // Prevent user from unmapping kernel text/data/stack/MMIO pages
+    // from their own page table — that would crash the kernel on next trap.
+    if virt < 0x5000_0000 || virt >= 0x8000_0000 {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
     let current = unsafe { CURRENT_PID };
     let satp = unsafe { PROCS[current].satp };
     let root = kvm::satp_to_root(satp);
@@ -596,10 +981,24 @@ pub fn sys_free_pages(frame: &mut TrapFrame) {
         return;
     }
 
-    // Zero the page before freeing (security)
+    // Validate alignment
+    if phys % PAGE_SIZE != 0 {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    // SECURITY: Verify the page is actually allocated before zeroing.
+    // Without this, a malicious process could pass a kernel page table
+    // address and zero_page would destroy it before free() rejects it.
+    let alloc = unsafe { crate::page_alloc::get() };
+    if !alloc.is_allocated(phys) {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
+    // Zero the page before freeing (prevent data leaks between processes)
     unsafe { crate::page_alloc::BitmapAllocator::zero_page(phys); }
 
-    let alloc = unsafe { crate::page_alloc::get() };
     match alloc.free(phys) {
         Ok(()) => {
             frame.a0 = 0;
