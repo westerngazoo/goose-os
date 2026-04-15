@@ -1,0 +1,1 @@
+/mnt/c/projects/goose-os/user/hello/target/riscv64gc-unknown-none-elf/release/hello: /mnt/c/projects/goose-os/user/hello/src/gooseos.rs /mnt/c/projects/goose-os/user/hello/src/main.rs /mnt/c/projects/goose-os/user/hello/src/start.S

@@ -1,0 +1,38 @@
+thread 'rustc' panicked at /rustc-dev/7e46c5f6fb87f8cf4353e058479cef15d1d952b4/library/core/src/slice/index.rs:1031:55:
+slice index starts at 5 but ends at 3
+stack backtrace:
+   0:     0x74ee21d73f6b - <std[98e825b980ace71a]::backtrace::Backtrace>::create
+   1:     0x74ee21d73eb5 - <std[98e825b980ace71a]::backtrace::Backtrace>::force_capture
+   2:     0x74ee20d8c3eb - std[98e825b980ace71a]::panicking::update_hook::<alloc[b62ea9019244d580]::boxed::Box<rustc_driver_impl[793884a437c970ce]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x74ee21d86a62 - std[98e825b980ace71a]::panicking::panic_with_hook
+   4:     0x74ee21d69448 - std[98e825b980ace71a]::panicking::panic_handler::{closure#0}
+   5:     0x74ee21d60179 - std[98e825b980ace71a]::sys::backtrace::__rust_end_short_backtrace::<std[98e825b980ace71a]::panicking::panic_handler::{closure#0}, !>
+   6:     0x74ee21d6aead - __rustc[a9b4a1fa1acd65d2]::rust_begin_unwind
+   7:     0x74ee1ead621c - core[c0e9ef583ed961cc]::panicking::panic_fmt
+   8:     0x74ee1f6238ad - core[c0e9ef583ed961cc]::slice::index::slice_index_fail
+   9:     0x74ee20620275 - <annotate_snippets[57ef6528fb48fd3b]::renderer::styled_buffer::StyledBuffer>::replace
+  10:     0x74ee236bc842 - annotate_snippets[57ef6528fb48fd3b]::renderer::render::render
+  11:     0x74ee238d2d4b - <rustc_errors[e7a493665415a425]::annotate_snippet_emitter_writer::AnnotateSnippetEmitter>::emit_messages_default
+  12:     0x74ee238cb6df - <rustc_errors[e7a493665415a425]::annotate_snippet_emitter_writer::AnnotateSnippetEmitter as rustc_errors[e7a493665415a425]::emitter::Emitter>::emit_diagnostic
+  13:     0x74ee238ca97f - <rustc_errors[e7a493665415a425]::json::Diagnostic>::from_errors_diagnostic
+  14:     0x74ee238ca0e1 - <rustc_errors[e7a493665415a425]::json::JsonEmitter as rustc_errors[e7a493665415a425]::emitter::Emitter>::emit_diagnostic
+  15:     0x74ee238c8e30 - <rustc_errors[e7a493665415a425]::DiagCtxtInner>::emit_diagnostic::{closure#3}
+  16:     0x74ee238c7004 - rustc_interface[6373f0af38dffaf7]::callbacks::track_diagnostic::<core[c0e9ef583ed961cc]::option::Option<rustc_span[42d786684e9ef5a5]::ErrorGuaranteed>>
+  17:     0x74ee238c59f1 - <rustc_errors[e7a493665415a425]::DiagCtxtInner>::emit_diagnostic
+  18:     0x74ee238c589f - <rustc_errors[e7a493665415a425]::DiagCtxtHandle>::emit_diagnostic
+  19:     0x74ee1e5bd94a - <rustc_span[42d786684e9ef5a5]::ErrorGuaranteed as rustc_errors[e7a493665415a425]::diagnostic::EmissionGuarantee>::emit_producing_guarantee
+  20:     0x74ee233d6913 - <rustc_parse[b0bb3e3b665926]::parser::Parser>::error_on_forbidden_inner_attr
+  21:     0x74ee226c9a0d - <rustc_parse[b0bb3e3b665926]::parser::Parser>::parse_outer_attributes
+  22:     0x74ee226c6eb5 - <rustc_parse[b0bb3e3b665926]::parser::Parser>::parse_mod
+  23:     0x74ee23408f87 - rustc_interface[6373f0af38dffaf7]::passes::parse
+  24:     0x74ee2360ae64 - rustc_interface[6373f0af38dffaf7]::interface::run_compiler::<(), rustc_driver_impl[793884a437c970ce]::run_compiler::{closure#0}>::{closure#1}
+  25:     0x74ee235f67fe - std[98e825b980ace71a]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[6373f0af38dffaf7]::util::run_in_thread_with_globals<rustc_interface[6373f0af38dffaf7]::util::run_in_thread_pool_with_globals<rustc_interface[6373f0af38dffaf7]::interface::run_compiler<(), rustc_driver_impl[793884a437c970ce]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  26:     0x74ee235f70a0 - <std[98e825b980ace71a]::thread::lifecycle::spawn_unchecked<rustc_interface[6373f0af38dffaf7]::util::run_in_thread_with_globals<rustc_interface[6373f0af38dffaf7]::util::run_in_thread_pool_with_globals<rustc_interface[6373f0af38dffaf7]::interface::run_compiler<(), rustc_driver_impl[793884a437c970ce]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[c0e9ef583ed961cc]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  27:     0x74ee235f7f2c - <std[98e825b980ace71a]::sys::thread::unix::Thread>::new::thread_start
+  28:     0x74ee1ce9caa4 - <unknown>
+  29:     0x74ee1cf29c6c - <unknown>
+  30:                0x0 - <unknown>
+
+
+rustc version: 1.96.0-nightly (7e46c5f6f 2026-04-01)
+platform: x86_64-unknown-linux-gnu
