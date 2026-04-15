@@ -976,8 +976,8 @@ impl<'a> Interpreter<'a> {
                     let target = self.read_u32_leb128()?;
 
                     if target < self.num_imports {
-                        // Host function call
-                        let type_idx = self.module.func_types[target as usize] as usize;
+                        // Host function call — type comes from import_types, not func_types
+                        let type_idx = self.module.import_types[target as usize] as usize;
                         let func_type = &self.module.types[type_idx];
                         let param_count = func_type.param_count;
 

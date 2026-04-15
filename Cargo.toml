@@ -8,6 +8,7 @@ default = ["qemu"]
 qemu = []
 vf2 = []
 security-test = ["qemu"]  # Boots security test process instead of normal init
+wasm-test = []            # Runs WASM/WASI hello world via interpreter (no userspace)
 debug-kernel = []          # Enable kdebug!/kdump macros (verbose kernel tracing)
 
 [profile.dev]

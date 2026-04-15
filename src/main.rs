@@ -37,6 +37,8 @@ mod security;
 mod wasm;
 #[allow(dead_code)]
 mod interp;
+#[allow(dead_code)]
+mod wasi;
 
 
 // ── Kernel code (only compiled for RISC-V target, not during host tests) ──
@@ -44,7 +46,7 @@ mod interp;
 #[cfg(not(test))]
 mod kernel {
     use core::arch::{asm, global_asm};
-    use crate::{page_alloc, kvm, process, println, platform, trap, plic, uart};
+    use crate::{page_alloc, kvm, process, println, platform, trap, plic, uart, wasi};
 
     // Include the RISC-V assembly boot code.
     global_asm!(include_str!("boot.S"));
@@ -128,10 +130,30 @@ mod kernel {
             alloc.allocated_count(), alloc.free_count());
         println!();
 
+        // === Phase 16: WASM test mode ===
+        // If wasm-test feature is active, run the WASM interpreter instead
+        // of launching normal user processes. Tests WASI Hello World.
+        #[cfg(feature = "wasm-test")]
+        {
+            println!("  [wasm] === WASM/WASI Test ===");
+            println!();
+            let code = wasi::run_wasm_test();
+            println!();
+            println!("  [wasm] Exit code: {}", code);
+            if code == 0 {
+                println!("  [wasm] PASSED");
+            } else {
+                println!("  [wasm] FAILED");
+            }
+            println!();
+            trap::post_process_exit(); // enter idle loop (Ctrl-R to reboot)
+        }
+
         // === Phase 12: Create processes + launch scheduler ===
         // Creates init (PID 1) + UART server (PID 2), then srets to PID 1.
         // RPC between processes — init calls server, server prints + replies.
         // After all processes exit, control returns to post_process_exit().
+        #[cfg(not(feature = "wasm-test"))]
         process::launch();
     }
 

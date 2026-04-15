@@ -21,10 +21,18 @@ const WASM_VERSION: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
 
 // Section IDs (from the WASM binary spec)
 const SEC_TYPE: u8 = 1;
+const SEC_IMPORT: u8 = 2;
 const SEC_FUNCTION: u8 = 3;
 const SEC_MEMORY: u8 = 5;
 const SEC_EXPORT: u8 = 7;
 const SEC_CODE: u8 = 10;
+const SEC_DATA: u8 = 11;
+
+// Import kinds
+const IMPORT_FUNC: u8 = 0x00;
+const IMPORT_TABLE: u8 = 0x01;
+const IMPORT_MEMORY: u8 = 0x02;
+const IMPORT_GLOBAL: u8 = 0x03;
 
 // Value types
 pub const VAL_I32: u8 = 0x7F;
@@ -42,10 +50,13 @@ pub const EXPORT_GLOBAL: u8 = 0x03;
 
 const MAX_TYPES: usize = 32;
 const MAX_FUNCS: usize = 64;
+const MAX_IMPORTS: usize = 16;
 const MAX_EXPORTS: usize = 16;
 const MAX_PARAMS: usize = 8;
 const MAX_RESULTS: usize = 4;
 const MAX_EXPORT_NAME: usize = 32;
+const MAX_IMPORT_NAME: usize = 32;
+const MAX_DATA_SEGS: usize = 8;
 
 // ── Error Type ────────────────────────────────────────────────
 
@@ -68,6 +79,10 @@ pub enum WasmError {
     ExportNameTooLong,
     TypeIndexOutOfBounds,
     MissingCodeSection,
+    TooManyImports,
+    TooManyDataSegments,
+    InvalidDataSegment,
+    ImportNameTooLong,
 }
 
 // ── Parsed Structures ─────────────────────────────────────────
@@ -134,6 +149,21 @@ impl Export {
     }
 }
 
+/// A data segment — pre-initialized bytes loaded into linear memory.
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug))]
+pub struct DataSegment {
+    pub offset: u32,         // destination offset in linear memory
+    pub data_offset: usize,  // byte offset into the raw WASM binary
+    pub data_len: usize,     // length of data bytes
+}
+
+impl DataSegment {
+    const fn empty() -> Self {
+        DataSegment { offset: 0, data_offset: 0, data_len: 0 }
+    }
+}
+
 /// A function body from the code section.
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug))]
@@ -149,9 +179,15 @@ pub struct WasmModule {
     pub types: [FuncType; MAX_TYPES],
     pub type_count: usize,
 
-    // Function section (type indices)
-    pub func_types: [u32; MAX_FUNCS],   // type index for each function
-    pub func_count: usize,
+    // Import section (function imports only — table/memory/global skipped)
+    pub import_count: usize,
+    pub import_types: [u32; MAX_IMPORTS],                // type index per import
+    pub import_names: [[u8; MAX_IMPORT_NAME]; MAX_IMPORTS], // field name bytes
+    pub import_name_lens: [usize; MAX_IMPORTS],          // field name lengths
+
+    // Function section (type indices for LOCAL functions)
+    pub func_types: [u32; MAX_FUNCS],   // type index for each local function
+    pub func_count: usize,              // count of local functions (excludes imports)
 
     // Memory section
     pub memory: MemoryLimits,
@@ -164,6 +200,10 @@ pub struct WasmModule {
     // Code section (offsets into the binary)
     pub bodies: [FuncBody; MAX_FUNCS],
     pub body_count: usize,
+
+    // Data section (pre-initialized linear memory)
+    pub data_segments: [DataSegment; MAX_DATA_SEGS],
+    pub data_segment_count: usize,
 }
 
 impl WasmModule {
@@ -171,6 +211,10 @@ impl WasmModule {
         WasmModule {
             types: [FuncType::empty(); MAX_TYPES],
             type_count: 0,
+            import_count: 0,
+            import_types: [0; MAX_IMPORTS],
+            import_names: [[0; MAX_IMPORT_NAME]; MAX_IMPORTS],
+            import_name_lens: [0; MAX_IMPORTS],
             func_types: [0; MAX_FUNCS],
             func_count: 0,
             memory: MemoryLimits { min_pages: 0, max_pages: 0, has_max: false },
@@ -179,6 +223,8 @@ impl WasmModule {
             export_count: 0,
             bodies: [FuncBody { offset: 0, length: 0 }; MAX_FUNCS],
             body_count: 0,
+            data_segments: [DataSegment::empty(); MAX_DATA_SEGS],
+            data_segment_count: 0,
         }
     }
 
@@ -192,6 +238,24 @@ impl WasmModule {
             i += 1;
         }
         None
+    }
+
+    /// Create an empty module (public for use in tests).
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self::new()
+    }
+
+    /// Compare import field name at index `i` against a string.
+    pub fn import_name_eq(&self, i: usize, s: &[u8]) -> bool {
+        if i >= self.import_count { return false; }
+        if self.import_name_lens[i] != s.len() { return false; }
+        let mut j = 0;
+        while j < s.len() {
+            if self.import_names[i][j] != s[j] { return false; }
+            j += 1;
+        }
+        true
     }
 
     /// Get the type signature for a function by its function index.
@@ -296,12 +360,14 @@ pub fn parse(data: &[u8]) -> Result<WasmModule, WasmError> {
 
         match section_id {
             SEC_TYPE => parse_type_section(&mut cursor, &mut module)?,
+            SEC_IMPORT => parse_import_section(&mut cursor, &mut module)?,
             SEC_FUNCTION => parse_function_section(&mut cursor, &mut module)?,
             SEC_MEMORY => parse_memory_section(&mut cursor, &mut module)?,
             SEC_EXPORT => parse_export_section(&mut cursor, &mut module)?,
             SEC_CODE => parse_code_section(&mut cursor, &mut module, data)?,
+            SEC_DATA => parse_data_section(&mut cursor, &mut module)?,
             _ => {
-                // Skip unknown/unneeded sections (custom, import, table, global, etc.)
+                // Skip unknown/unneeded sections (custom, table, element, global, etc.)
                 cursor.skip(section_len)?;
             }
         }
@@ -488,6 +554,116 @@ fn parse_code_section(
         module.body_count += 1;
 
         cursor.skip(body_size)?;
+    }
+
+    Ok(())
+}
+
+fn parse_import_section(cursor: &mut Cursor, module: &mut WasmModule) -> Result<(), WasmError> {
+    let count = cursor.read_u32_leb128()? as usize;
+
+    for _ in 0..count {
+        // Read module name (e.g. "wasi_snapshot_preview1") — skip it
+        let mod_name_len = cursor.read_u32_leb128()? as usize;
+        cursor.skip(mod_name_len)?;
+
+        // Read field name (e.g. "fd_write") — store it for WASI dispatch
+        let field_name_len = cursor.read_u32_leb128()? as usize;
+        let field_name_bytes = cursor.read_bytes(field_name_len)?;
+
+        // Read import kind
+        let kind = cursor.read_byte()?;
+
+        match kind {
+            IMPORT_FUNC => {
+                if module.import_count >= MAX_IMPORTS {
+                    return Err(WasmError::TooManyImports);
+                }
+                let type_idx = cursor.read_u32_leb128()?;
+                if type_idx as usize >= module.type_count {
+                    return Err(WasmError::TypeIndexOutOfBounds);
+                }
+                module.import_types[module.import_count] = type_idx;
+
+                // Store field name (truncate if too long)
+                let copy_len = if field_name_len <= MAX_IMPORT_NAME {
+                    field_name_len
+                } else {
+                    MAX_IMPORT_NAME
+                };
+                let mut i = 0;
+                while i < copy_len {
+                    module.import_names[module.import_count][i] = field_name_bytes[i];
+                    i += 1;
+                }
+                module.import_name_lens[module.import_count] = copy_len;
+
+                module.import_count += 1;
+            }
+            IMPORT_TABLE => {
+                // Table: element type + limits
+                cursor.read_byte()?;  // element type (0x70 = funcref)
+                let flags = cursor.read_byte()?;
+                cursor.read_u32_leb128()?; // min
+                if flags & 0x01 != 0 { cursor.read_u32_leb128()?; } // max
+            }
+            IMPORT_MEMORY => {
+                // Memory: limits
+                let flags = cursor.read_byte()?;
+                cursor.read_u32_leb128()?; // min
+                if flags & 0x01 != 0 { cursor.read_u32_leb128()?; } // max
+            }
+            IMPORT_GLOBAL => {
+                // Global: value type + mutability
+                cursor.read_byte()?;  // value type
+                cursor.read_byte()?;  // mutability
+            }
+            _ => return Err(WasmError::InvalidSection),
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_data_section(cursor: &mut Cursor, module: &mut WasmModule) -> Result<(), WasmError> {
+    let count = cursor.read_u32_leb128()? as usize;
+
+    for _ in 0..count {
+        if module.data_segment_count >= MAX_DATA_SEGS {
+            return Err(WasmError::TooManyDataSegments);
+        }
+
+        // Data segment kind: 0 = active (memory 0, with offset expression)
+        let kind = cursor.read_u32_leb128()?;
+        if kind != 0 {
+            // Passive (kind=1) or active-with-index (kind=2) — not needed for MVP
+            return Err(WasmError::InvalidDataSegment);
+        }
+
+        // Evaluate constant offset expression: must be (i32.const N) (end)
+        let opcode = cursor.read_byte()?;
+        if opcode != 0x41 {
+            // 0x41 = i32.const — only supported offset expression
+            return Err(WasmError::InvalidDataSegment);
+        }
+        let offset = cursor.read_u32_leb128()?;
+
+        let end = cursor.read_byte()?;
+        if end != 0x0B {
+            return Err(WasmError::InvalidDataSegment);
+        }
+
+        // Read data bytes
+        let data_len = cursor.read_u32_leb128()? as usize;
+        let data_offset = cursor.pos;
+        cursor.skip(data_len)?;
+
+        module.data_segments[module.data_segment_count] = DataSegment {
+            offset,
+            data_offset,
+            data_len,
+        };
+        module.data_segment_count += 1;
     }
 
     Ok(())
@@ -730,5 +906,155 @@ mod tests {
         assert_eq!(module.find_export(b"add", EXPORT_FUNC), Some(0));
         assert_eq!(module.find_export(b"memory", EXPORT_MEMORY), Some(0));
         assert_eq!(module.find_export(b"add", EXPORT_MEMORY), None);
+    }
+
+    /// Parse import section: one function import (fd_write).
+    #[test]
+    fn test_parse_import_section() {
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // header
+            // Type section: type 0 = (i32,i32,i32,i32)->i32
+            0x01, 0x09,
+            0x01, 0x60,
+            0x04, 0x7F, 0x7F, 0x7F, 0x7F, // 4 params: i32×4
+            0x01, 0x7F,                     // 1 result: i32
+            // Import section: 1 import
+            // Content: 1 + (1+4) + (1+8) + 1 + 1 = 17
+            0x02, 0x11,                     // section id=2, length=17
+            0x01,                           // 1 import
+            // module name: "wasi" (4 bytes)
+            0x04, b'w', b'a', b's', b'i',
+            // field name: "fd_write" (8 bytes)
+            0x08, b'f', b'd', b'_', b'w', b'r', b'i', b't', b'e',
+            // kind: function, type index: 0
+            0x00, 0x00,
+        ];
+        let module = parse(&wasm).expect("should parse import");
+        assert_eq!(module.import_count, 1);
+        assert_eq!(module.import_types[0], 0);
+        assert!(module.import_name_eq(0, b"fd_write"));
+        assert!(!module.import_name_eq(0, b"fd_read"));
+        // func_count should be 0 (no local functions)
+        assert_eq!(module.func_count, 0);
+    }
+
+    /// Parse import + function + export: verify function index space.
+    /// Import 0 = fd_write, Local function 0 = _start (exported as func index 1).
+    #[test]
+    fn test_parse_import_with_local_func() {
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // header
+            // Type section: 2 types
+            0x01, 0x0C,                     // type section, len=12
+            0x02,                           // 2 types
+            0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 0: (i32×4)->i32
+            0x60, 0x00, 0x00,               // type 1: ()->()
+            // Import section: 1 function import
+            // Content: 1 + (1+4) + (1+8) + 1 + 1 = 17
+            0x02, 0x11,
+            0x01,
+            0x04, b'w', b'a', b's', b'i',
+            0x08, b'f', b'd', b'_', b'w', b'r', b'i', b't', b'e',
+            0x00, 0x00,                     // function, type 0
+            // Function section: 1 local function, type 1
+            0x03, 0x02,
+            0x01, 0x01,
+            // Export section: export "_start" as function 1
+            0x07, 0x0A,
+            0x01,
+            0x06, b'_', b's', b't', b'a', b'r', b't',
+            0x00, 0x01,                     // function index 1 (import 0 + local 0)
+            // Code section: 1 body (empty _start)
+            0x0A, 0x04,
+            0x01,                           // 1 body
+            0x02,                           // body size = 2
+            0x00,                           // 0 locals
+            0x0B,                           // end
+        ];
+        let module = parse(&wasm).expect("should parse import + func");
+        assert_eq!(module.import_count, 1);
+        assert_eq!(module.func_count, 1);
+        assert_eq!(module.body_count, 1);
+        // Export "_start" is at function index 1 (import_count + 0)
+        assert_eq!(module.find_export(b"_start", EXPORT_FUNC), Some(1));
+        // Import type check
+        assert_eq!(module.import_types[0], 0);
+        // Local function type check
+        assert_eq!(module.func_types[0], 1);
+    }
+
+    /// Parse data section: one segment at offset 100, 5 bytes of data.
+    #[test]
+    fn test_parse_data_section() {
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // header
+            // Memory section: 1 page
+            0x05, 0x03, 0x01, 0x00, 0x01,
+            // Data section
+            0x0B, 0x0B,                     // section id=11, length=11
+            0x01,                           // 1 segment
+            0x00,                           // kind=0 (active, memory 0)
+            0x41, 0x64,                     // i32.const 100
+            0x0B,                           // end expr
+            0x05,                           // data length = 5
+            b'H', b'e', b'l', b'l', b'o',  // "Hello"
+        ];
+        let module = parse(&wasm).expect("should parse data section");
+        assert_eq!(module.data_segment_count, 1);
+        assert_eq!(module.data_segments[0].offset, 100);
+        assert_eq!(module.data_segments[0].data_len, 5);
+        // Verify data_offset points to "Hello" in the raw binary
+        let start = module.data_segments[0].data_offset;
+        assert_eq!(&wasm[start..start + 5], b"Hello");
+    }
+
+    /// Parse a complete module with import, function, data, and export.
+    #[test]
+    fn test_parse_wasi_hello_module() {
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // header
+            // Type section: 2 types
+            0x01, 0x0C,                     // type section, len=12
+            0x02,
+            0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 0: fd_write sig
+            0x60, 0x00, 0x00,                                 // type 1: _start sig
+            // Import section: 1 import (len=17)
+            0x02, 0x11,
+            0x01,
+            0x04, b'w', b'a', b's', b'i',
+            0x08, b'f', b'd', b'_', b'w', b'r', b'i', b't', b'e',
+            0x00, 0x00,
+            // Function section: 1 local
+            0x03, 0x02,
+            0x01, 0x01,
+            // Memory section: 1 page
+            0x05, 0x03, 0x01, 0x00, 0x01,
+            // Export: "_start" = func 1, "memory" = memory 0 (len=19)
+            0x07, 0x13,
+            0x02,
+            0x06, b'_', b's', b't', b'a', b'r', b't', 0x00, 0x01,
+            0x06, b'm', b'e', b'm', b'o', b'r', b'y', 0x02, 0x00,
+            // Code section
+            0x0A, 0x04,
+            0x01, 0x02, 0x00, 0x0B,
+            // Data section: "Hi" at offset 50
+            0x0B, 0x08,
+            0x01, 0x00,
+            0x41, 0x32,                     // i32.const 50
+            0x0B,
+            0x02, b'H', b'i',
+        ];
+        let module = parse(&wasm).expect("should parse WASI hello");
+        assert_eq!(module.type_count, 2);
+        assert_eq!(module.import_count, 1);
+        assert!(module.import_name_eq(0, b"fd_write"));
+        assert_eq!(module.func_count, 1);
+        assert_eq!(module.export_count, 2);
+        assert_eq!(module.find_export(b"_start", EXPORT_FUNC), Some(1));
+        assert_eq!(module.find_export(b"memory", EXPORT_MEMORY), Some(0));
+        assert!(module.has_memory);
+        assert_eq!(module.data_segment_count, 1);
+        assert_eq!(module.data_segments[0].offset, 50);
+        assert_eq!(module.data_segments[0].data_len, 2);
     }
 }

@@ -64,6 +64,30 @@ deploy-debug:
 	git push
 	@echo ">>> DEPLOYED debug kernel build $(NEXT_BUILD)"
 
+# WASM/WASI test: runs the WASM interpreter with a hand-crafted Hello World.
+# Expected output: "Hello from WASM!" then exit code 0.
+run-wasm:
+	GOOSE_BUILD=wasm cargo build --release --features "qemu wasm-test" --no-default-features
+	@echo "=== WASM/WASI Test ==="
+	$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL_ELF)
+
+test-wasm:
+	GOOSE_BUILD=wasm cargo build --release --features "qemu wasm-test" --no-default-features
+	@echo "=== WASM/WASI Test ==="
+	timeout 5 $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL_ELF) || true
+
+# Deploy WASM test kernel to VF2
+deploy-wasm:
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	GOOSE_BUILD=$(NEXT_BUILD) RUSTFLAGS="-C link-arg=-Tlinker-vf2.ld" \
+	  cargo build --release --features "vf2 wasm-test" --no-default-features
+	$(OBJCOPY) -O binary $(KERNEL_ELF) kernel.bin
+	@ls -lh kernel.bin
+	git add kernel.bin src/ Makefile Cargo.toml linker.ld linker-vf2.ld .build_number goose-upgrade.sh
+	git commit -m "Build $(NEXT_BUILD) (wasm-test)" --allow-empty || true
+	git push
+	@echo ">>> DEPLOYED wasm-test kernel build $(NEXT_BUILD)"
+
 # Security test: boots a malicious process that tests all attack vectors.
 # Expected output: P1..P8 (pass), K9 (attempt), then "Process fault" + kill.
 # Any "F<n>" or "!!!" in the output means a security check is broken.
