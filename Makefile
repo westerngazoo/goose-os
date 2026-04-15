@@ -88,6 +88,33 @@ deploy-wasm:
 	git push
 	@echo ">>> DEPLOYED wasm-test kernel build $(NEXT_BUILD)"
 
+# Rust userspace: boots a compiled Rust ELF binary as PID 1.
+build-user:
+	cd user/hello && CARGO_ENCODED_RUSTFLAGS='-Clink-arg=-Tlinker.ld' cargo build --release
+
+run-rust-user: build-user
+	GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features "qemu rust-user" --no-default-features
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	@echo ">>> Rust userspace — compiled Rust ELF as PID 1"
+	$(QEMU) $(QEMU_ARGS) -kernel $(KERNEL_ELF)
+
+test-rust-user: build-user
+	GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features "qemu rust-user" --no-default-features
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	@echo "=== Rust Userspace Test ==="
+	timeout 5 $(QEMU) $(QEMU_ARGS) -kernel $(KERNEL_ELF) || true
+
+deploy-rust-user: build-user
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	GOOSE_BUILD=$(NEXT_BUILD) RUSTFLAGS="-C link-arg=-Tlinker-vf2.ld" \
+	  cargo build --release --features "vf2 rust-user" --no-default-features
+	$(OBJCOPY) -O binary $(KERNEL_ELF) kernel.bin
+	@ls -lh kernel.bin
+	git add kernel.bin src/ user/ Makefile Cargo.toml linker.ld linker-vf2.ld .build_number goose-upgrade.sh
+	git commit -m "Build $(NEXT_BUILD) (rust-user)" --allow-empty || true
+	git push
+	@echo ">>> DEPLOYED rust-user kernel build $(NEXT_BUILD)"
+
 # Security test: boots a malicious process that tests all attack vectors.
 # Expected output: P1..P8 (pass), K9 (attempt), then "Process fault" + kill.
 # Any "F<n>" or "!!!" in the output means a security check is broken.

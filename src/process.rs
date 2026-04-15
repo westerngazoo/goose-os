@@ -703,7 +703,25 @@ pub fn launch() -> ! {
         create_process(1, test_start, test_size);
     }
 
-    #[cfg(not(feature = "security-test"))]
+    #[cfg(feature = "rust-user")]
+    {
+        // Compiled Rust userspace binary (built by: make build-user)
+        static HELLO_ELF: &[u8] = include_bytes!(
+            "../user/hello/target/riscv64gc-unknown-none-elf/release/hello"
+        );
+
+        println!("  [proc] === RUST USERSPACE MODE ===");
+        println!("  [proc] Loading Rust hello ({} bytes)...", HELLO_ELF.len());
+
+        let info = match crate::elf::parse(HELLO_ELF) {
+            Ok(info) => info,
+            Err(e) => panic!("Failed to parse user ELF: {:?}", e),
+        };
+
+        create_process_from_elf(1, &info, HELLO_ELF);
+    }
+
+    #[cfg(not(any(feature = "security-test", feature = "rust-user")))]
     {
         extern "C" {
             static _user_init_start: u8;
@@ -724,9 +742,6 @@ pub fn launch() -> ! {
         create_process(2, uart_start, uart_size);
 
         // Map UART MMIO into PID 2's address space at a USER-accessible VA.
-        // We can't reuse VA 0x10000000 because map_kernel_regions already maps it
-        // with KERNEL_MMIO (no U bit) — overwriting that would block kernel println!.
-        // Instead, map the UART physical address at a separate user VA.
         const UART_USER_VA: usize = 0x5E00_0000;
         let root2 = kvm::satp_to_root(unsafe { PROCS[2].satp });
         kvm::map_user_page(root2, UART_USER_VA, crate::platform::UART_BASE, USER_MMIO);
@@ -1337,6 +1352,90 @@ fn create_process(
 
     println!("  [proc] PID {} created (code={:#x}, {} bytes, sp={:#x}, satp={:#018x})",
         pid, user_code, code_size, user_sp, satp);
+}
+
+/// Kernel-level spawn from a parsed ELF binary in kernel memory.
+///
+/// Like sys_spawn but reads ELF data from kernel .rodata (via include_bytes!)
+/// instead of user memory. Used at boot to load compiled Rust userspace binaries.
+fn create_process_from_elf(
+    pid: usize,
+    info: &crate::elf::ElfInfo,
+    elf_data: &[u8],
+) {
+    assert!(pid > 0 && pid < MAX_PROCS, "invalid PID");
+
+    let user_root = kvm::alloc_zeroed_page();
+    kvm::map_kernel_regions(user_root);
+
+    // Load each PT_LOAD segment
+    for seg_idx in 0..info.num_segments {
+        let seg = &info.segments[seg_idx];
+        let flags = if seg.executable { USER_RX } else { USER_RW };
+
+        let num_pages = crate::elf::pages_needed(seg.memsz, seg.vaddr);
+        let base_va = seg.vaddr & !(PAGE_SIZE - 1);
+
+        for p in 0..num_pages {
+            let va = base_va + p * PAGE_SIZE;
+            let page = kvm::alloc_zeroed_page();
+
+            let page_start = va;
+            let page_end = va + PAGE_SIZE;
+            let seg_file_start = seg.vaddr;
+            let seg_file_end = seg.vaddr + seg.filesz;
+
+            let copy_start = if seg_file_start > page_start { seg_file_start } else { page_start };
+            let copy_end = if seg_file_end < page_end { seg_file_end } else { page_end };
+
+            if copy_start < copy_end {
+                let file_offset = seg.file_offset + (copy_start - seg.vaddr);
+                let dst_offset = copy_start - page_start;
+                let len = copy_end - copy_start;
+
+                unsafe {
+                    let src = elf_data.as_ptr().add(file_offset);
+                    let dst = (page as *mut u8).add(dst_offset);
+                    for b in 0..len {
+                        core::ptr::write_volatile(dst.add(b), core::ptr::read_volatile(src.add(b)));
+                    }
+                }
+            }
+
+            kvm::map_user_page(user_root, va, page, flags);
+        }
+    }
+
+    // Allocate user stack
+    let user_stack = kvm::alloc_zeroed_page();
+    let stack_va = 0x7FFF_0000;
+    kvm::map_user_page(user_root, stack_va, user_stack, USER_RW);
+    let user_sp = stack_va + PAGE_SIZE;
+
+    let satp = make_satp(user_root, pid as u16);
+
+    let mut ctx = TrapFrame::zero();
+    ctx.sepc = info.entry;
+    ctx.sp = user_sp;
+    ctx.sstatus = 1 << 5; // SPIE=1, SPP=0 (U-mode)
+
+    unsafe {
+        PROCS[pid] = Process {
+            pid,
+            state: ProcessState::Ready,
+            satp,
+            context: ctx,
+            ipc_target: 0,
+            ipc_value: 0,
+            parent: 0,
+            exit_code: 0,
+            irq_num: 0,
+            irq_pending: false,
+        };
+    }
+
+    println!("  [proc] PID {} created from ELF (entry={:#x}, {} segments, sp={:#x})",
+        pid, info.entry, info.num_segments, user_sp);
 }
 
 // ── IPC Syscall Handlers ──────────────────────────────────────

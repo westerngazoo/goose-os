@@ -9,6 +9,7 @@ qemu = []
 vf2 = []
 security-test = ["qemu"]  # Boots security test process instead of normal init
 wasm-test = []            # Runs WASM/WASI hello world via interpreter (no userspace)
+rust-user = []            # Boot compiled Rust ELF binary as PID 1 (no assembly userspace)
 debug-kernel = []          # Enable kdebug!/kdump macros (verbose kernel tracing)
 
 [profile.dev]
