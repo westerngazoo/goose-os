@@ -85,6 +85,15 @@ pub fn init() -> usize {
     map_range(root_phys, plic_base, plic_base + PLIC_MAP_SIZE, KERNEL_MMIO);
     crate::println!("    PLIC    {:#010x} - {:#010x} (R+W, MMIO)", plic_base, plic_base + PLIC_MAP_SIZE);
 
+    // Map VirtIO MMIO region (8 device slots)
+    #[cfg(feature = "qemu")]
+    {
+        let virtio_base = platform::VIRTIO_MMIO_BASE;
+        let virtio_end = virtio_base + platform::VIRTIO_MMIO_SLOTS * platform::VIRTIO_MMIO_STRIDE;
+        map_range(root_phys, virtio_base, virtio_end, KERNEL_MMIO);
+        crate::println!("    VirtIO  {:#010x} - {:#010x} (R+W, MMIO)", virtio_base, virtio_end);
+    }
+
     crate::println!("  [kvm] Kernel page table at {:#010x}", root_phys);
 
     root_phys
@@ -241,6 +250,13 @@ pub fn map_kernel_regions(root_phys: usize) {
     map_range(root_phys, uart_base, uart_base + PAGE_SIZE, KERNEL_MMIO);
     let plic_base = platform::PLIC_BASE;
     map_range(root_phys, plic_base, plic_base + PLIC_MAP_SIZE, KERNEL_MMIO);
+
+    #[cfg(feature = "qemu")]
+    {
+        let virtio_base = platform::VIRTIO_MMIO_BASE;
+        let virtio_end = virtio_base + platform::VIRTIO_MMIO_SLOTS * platform::VIRTIO_MMIO_STRIDE;
+        map_range(root_phys, virtio_base, virtio_end, KERNEL_MMIO);
+    }
 }
 
 /// Unmap a single virtual page from a page table.

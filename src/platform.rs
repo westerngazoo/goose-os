@@ -100,6 +100,33 @@ pub const TIMESLICE: u64 = TIMER_FREQ / 100;
 // Platform name (for boot banner)
 // ──────────────────────────────────────────
 
+// ──────────────────────────────────────────
+// VirtIO MMIO (QEMU virt only)
+// ──────────────────────────────────────────
+
+/// VirtIO MMIO transport region on QEMU virt machine.
+/// 8 device slots at 0x10001000-0x10008000, 0x1000 bytes apart.
+/// Each slot generates IRQ (slot_index + 1).
+#[cfg(feature = "qemu")]
+pub const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
+
+#[cfg(feature = "qemu")]
+pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
+
+#[cfg(feature = "qemu")]
+pub const VIRTIO_MMIO_SLOTS: usize = 8;
+
+/// VirtIO device IRQs on QEMU virt: slot N uses IRQ (N+1).
+#[cfg(feature = "qemu")]
+pub const VIRTIO_IRQ_BASE: u32 = 1;
+
+/// VirtIO device type IDs (from VirtIO spec).
+pub const VIRTIO_DEV_NET: u32 = 1;
+
+// ──────────────────────────────────────────
+// Platform name (for boot banner)
+// ──────────────────────────────────────────
+
 #[cfg(feature = "qemu")]
 pub const PLATFORM_NAME: &str = "QEMU virt";
 

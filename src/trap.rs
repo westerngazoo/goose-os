@@ -235,42 +235,45 @@ fn handle_ecall(frame: &mut TrapFrame) {
             return;
         }
         SYS_SEND => {
-            crate::process::sys_send(frame);
-            // sys_send handles sepc — don't advance
+            crate::ipc::sys_send(frame);
             return;
         }
         SYS_RECEIVE => {
-            crate::process::sys_receive(frame);
-            // sys_receive handles sepc — don't advance
+            crate::ipc::sys_receive(frame);
             return;
         }
         SYS_CALL => {
-            crate::process::sys_call(frame);
-            // sys_call handles sepc — don't advance
+            // Phase B: Intercept calls to the network server PID
+            #[cfg(feature = "net")]
+            if frame.a0 == crate::net::NET_SERVER_PID {
+                crate::net::handle_request(frame);
+                return;
+            }
+            crate::ipc::sys_call(frame);
             return;
         }
         SYS_REPLY => {
-            crate::process::sys_reply(frame);
+            crate::ipc::sys_reply(frame);
             return;
         }
         SYS_MAP => {
-            crate::process::sys_map(frame);
+            crate::syscall::sys_map(frame);
             return;
         }
         SYS_UNMAP => {
-            crate::process::sys_unmap(frame);
+            crate::syscall::sys_unmap(frame);
             return;
         }
         SYS_ALLOC_PAGES => {
-            crate::process::sys_alloc_pages(frame);
+            crate::syscall::sys_alloc_pages(frame);
             return;
         }
         SYS_FREE_PAGES => {
-            crate::process::sys_free_pages(frame);
+            crate::syscall::sys_free_pages(frame);
             return;
         }
         SYS_SPAWN => {
-            crate::process::sys_spawn(frame);
+            crate::syscall::sys_spawn(frame);
             return;
         }
         SYS_WAIT => {
@@ -286,11 +289,11 @@ fn handle_ecall(frame: &mut TrapFrame) {
             return;
         }
         SYS_IRQ_REGISTER => {
-            crate::process::sys_irq_register(frame);
+            crate::syscall::sys_irq_register(frame);
             return;
         }
         SYS_IRQ_ACK => {
-            crate::process::sys_irq_ack(frame);
+            crate::syscall::sys_irq_ack(frame);
             return;
         }
         SYS_REBOOT => {
@@ -376,12 +379,12 @@ fn handle_external(frame: &mut TrapFrame) {
     }
 
     // Check if a userspace process owns this IRQ
-    let owner = crate::process::irq_owner(irq);
+    let owner = crate::syscall::irq_owner(irq);
     kdebug!("external: IRQ {} owner={}", irq, owner);
     if owner != 0 {
         // Deliver as IPC notification — don't complete PLIC yet
         // (server must SYS_IRQ_ACK to re-enable this IRQ)
-        crate::process::irq_notify(irq, owner);
+        crate::ipc::irq_notify(irq, owner);
 
         // If we're in kernel idle (S-mode), schedule the woken process immediately
         if frame.sstatus & (1 << 8) != 0 {
@@ -398,6 +401,18 @@ fn handle_external(frame: &mut TrapFrame) {
             crate::uart::handle_interrupt();
         }
         _ => {
+            // Check if this is a VirtIO-net IRQ (kernel-handled)
+            #[cfg(feature = "net")]
+            if crate::virtio::is_ready() && irq == crate::virtio::irq_number() {
+                let dev = unsafe { crate::virtio::get() };
+                crate::driver::Device::handle_interrupt(dev);
+                // Poll smoltcp after receiving packets
+                let ticks = unsafe { TICKS };
+                let timestamp_ms = (ticks * 10) as i64;
+                crate::net::poll(timestamp_ms);
+                plic::complete(irq);
+                return;
+            }
             println!("[plic] unhandled IRQ: {}", irq);
         }
     }
@@ -423,6 +438,13 @@ fn handle_timer(frame: &mut TrapFrame) {
     // Re-arm for next timeslice
     let time = read_time();
     sbi_set_timer(time + platform::TIMESLICE);
+
+    // Poll network stack periodically (every 10 ticks = 100ms)
+    #[cfg(feature = "net")]
+    if ticks % 10 == 0 && crate::virtio::is_ready() {
+        let timestamp_ms = (ticks * 10) as i64;
+        crate::net::poll(timestamp_ms);
+    }
 
     // Preempt or schedule based on where we came from.
     if frame.sstatus & (1 << 8) == 0 {

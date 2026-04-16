@@ -115,6 +115,48 @@ deploy-rust-user: build-user
 	git push
 	@echo ">>> DEPLOYED rust-user kernel build $(NEXT_BUILD)"
 
+# ── Networking ──────────────────────────────────────────────────
+
+# QEMU args for virtio-net (user-mode networking)
+# force-legacy=false makes QEMU present VirtIO MMIO v2 (modern) transport
+# instead of v1 (legacy), which our driver expects.
+NET_ARGS := -global virtio-mmio.force-legacy=false \
+            -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+            -device virtio-net-device,netdev=net0
+
+# Run with networking enabled
+run-net:
+	GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features "qemu net" --no-default-features
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	@echo ">>> Network enabled: virtio-net + user-mode networking"
+	@echo ">>> Host port 2222 -> guest port 22"
+	$(QEMU) $(QEMU_ARGS) $(NET_ARGS) -kernel $(KERNEL_ELF)
+
+test-net:
+	GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features "qemu net" --no-default-features
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	@echo "=== Network Test ==="
+	timeout 5 $(QEMU) $(QEMU_ARGS) $(NET_ARGS) -kernel $(KERNEL_ELF) || true
+
+# Run with TAP networking (requires: sudo ip tuntap add dev tap0 mode tap)
+run-tap:
+	GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features "qemu net" --no-default-features
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	@echo ">>> TAP networking — requires: sudo ip tuntap add dev tap0 mode tap"
+	$(QEMU) $(QEMU_ARGS) \
+	  -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
+	  -device virtio-net-device,netdev=net0 \
+	  -kernel $(KERNEL_ELF)
+
+# Run with packet capture for network debugging
+run-net-debug:
+	GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features "qemu net debug-kernel" --no-default-features
+	@echo $(NEXT_BUILD) > $(BUILD_FILE)
+	@echo ">>> Packet capture to /tmp/goose-net.pcap"
+	$(QEMU) $(QEMU_ARGS) $(NET_ARGS) \
+	  -object filter-dump,id=f1,netdev=net0,file=/tmp/goose-net.pcap \
+	  -kernel $(KERNEL_ELF)
+
 # Security test: boots a malicious process that tests all attack vectors.
 # Expected output: P1..P8 (pass), K9 (attempt), then "Process fault" + kill.
 # Any "F<n>" or "!!!" in the output means a security check is broken.

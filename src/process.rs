@@ -1,21 +1,7 @@
-/// Process management — process table, IPC, context switching, scheduling, lifecycle.
+/// Process management — process table, context switching, scheduling, lifecycle.
 ///
-/// Phase 13: Userspace Device Servers (IRQ forwarding, UART server).
-///
-/// Design:
-///   - Fixed-size process table (no dynamic allocation in kernel)
-///   - Synchronous send/receive: sender blocks until receiver picks up
-///   - Call/Reply: RPC in one ecall (send + wait for reply)
-///   - Context switch via TrapFrame save/restore on the kernel stack
-///   - Each process has its own Sv39 page table
-///
-/// IPC model:
-///   SYS_SEND(target, msg)   — blocks until target calls RECEIVE
-///   SYS_RECEIVE(from)       — blocks until someone sends to us
-///   SYS_CALL(target, msg)   — send + block for SYS_REPLY (RPC)
-///   SYS_REPLY(target, reply)— deliver reply to BlockedCall process (non-blocking)
-///   Rendezvous: when send and receive meet, message transfers, both unblock.
-///   This is the seL4 model — no kernel-side message queues, no allocation.
+/// Core module: PCB, process table globals, boot/launch, scheduling.
+/// IPC syscalls live in ipc.rs, memory/IRQ/spawn syscalls in syscall.rs.
 
 use core::arch::{asm, global_asm};
 use crate::page_alloc::PAGE_SIZE;
@@ -26,8 +12,7 @@ use crate::{println, kdebug, kdump_csrs, kdump_plic, kdump_procs};
 
 // ── Constants ──────────────────────────────────────────────────
 
-const MAX_PROCS: usize = 8;
-const MAX_IRQS: usize = 64;
+use crate::security::{self, MAX_PROCS, MAX_IRQS};
 
 // ── Process State Machine ──────────────────────────────────────
 
@@ -53,6 +38,8 @@ pub struct Process {
     // IPC state
     pub ipc_target: usize,      // Who we're sending to / expecting from (0 = any)
     pub ipc_value: usize,       // Message being sent
+    pub ipc_arg2: usize,        // Additional IPC argument (a2) — Phase B
+    pub ipc_arg3: usize,        // Additional IPC argument (a3) — Phase B
     // Lifecycle
     pub parent: usize,          // Parent PID (0 = kernel-spawned)
     pub exit_code: usize,       // Stored when process exits
@@ -70,6 +57,8 @@ impl Process {
             context: TrapFrame::zero(),
             ipc_target: 0,
             ipc_value: 0,
+            ipc_arg2: 0,
+            ipc_arg3: 0,
             parent: 0,
             exit_code: 0,
             irq_num: 0,
@@ -82,13 +71,13 @@ impl Process {
 
 /// Process table — fixed size, no heap allocation.
 /// PID 0 is reserved (kernel). Processes use PIDs 1..MAX_PROCS-1.
-static mut PROCS: [Process; MAX_PROCS] = [Process::empty(); MAX_PROCS];
+pub(crate) static mut PROCS: [Process; MAX_PROCS] = [Process::empty(); MAX_PROCS];
 
 /// PID of the currently running process.
-static mut CURRENT_PID: usize = 0;
+pub(crate) static mut CURRENT_PID: usize = 0;
 
 /// IRQ ownership table — maps IRQ number to owning PID (0 = kernel/unclaimed).
-static mut IRQ_OWNER: [usize; MAX_IRQS] = [0; MAX_IRQS];
+pub(crate) static mut IRQ_OWNER: [usize; MAX_IRQS] = [0; MAX_IRQS];
 
 /// Get the currently running PID (for trap handler diagnostics).
 pub fn current_pid() -> usize {
@@ -137,7 +126,7 @@ pub fn kill_current(frame: &mut TrapFrame, exit_code: usize) {
         // Clean up IRQ ownership
         if PROCS[current].irq_num != 0 {
             let irq = PROCS[current].irq_num;
-            if (irq as usize) < MAX_IRQS {
+            if security::is_valid_irq(irq as usize) {
                 IRQ_OWNER[irq as usize] = 0;
             }
             PROCS[current].irq_num = 0;
@@ -797,511 +786,6 @@ pub fn launch() -> ! {
     }
 }
 
-// ── Syscall Handlers ───────────────────────────────────────────
-
-/// SYS_CALL(target_pid, msg_value) — synchronous RPC (send + wait for reply).
-///
-/// Convention: a0 = target PID, a1 = message value.
-/// Returns:    a0 = reply value (set by SYS_REPLY from server).
-///
-/// The caller sends a message and blocks until the target calls SYS_REPLY.
-/// This halves the syscall cost of an RPC round-trip compared to
-/// separate SYS_SEND + SYS_RECEIVE — one ecall instead of two.
-///
-/// Behavior:
-///   - If target is BlockedRecv: rendezvous (deliver msg), but caller
-///     stays BlockedCall until the target does SYS_REPLY.
-///   - If target is NOT BlockedRecv: caller blocks as BlockedCall,
-///     msg waits until target calls SYS_RECEIVE.
-pub fn sys_call(frame: &mut TrapFrame) {
-    frame.sepc += 4; // advance past ecall (saved with context)
-
-    let current = unsafe { CURRENT_PID };
-    let target_pid = frame.a0;
-    let msg_value = frame.a1;
-
-    // Validate target
-    if target_pid == 0 || target_pid >= MAX_PROCS || target_pid == current {
-        frame.a0 = usize::MAX; // error
-        return;
-    }
-
-    unsafe {
-        let target_state = PROCS[target_pid].state;
-        let target_wants = PROCS[target_pid].ipc_target;
-
-        // Check if target is blocked on RECEIVE (from us or from any)
-        if target_state == ProcessState::BlockedRecv
-            && (target_wants == 0 || target_wants == current)
-        {
-            // Rendezvous! Deliver message to receiver's saved context.
-            PROCS[target_pid].context.a0 = msg_value;  // message
-            PROCS[target_pid].context.a1 = current;     // sender PID
-            PROCS[target_pid].state = ProcessState::Ready;
-        }
-
-        // Caller ALWAYS blocks — even after rendezvous.
-        // The difference from SYS_SEND: SYS_SEND unblocks on rendezvous,
-        // SYS_CALL stays blocked waiting for SYS_REPLY.
-        PROCS[current].ipc_target = target_pid;
-        PROCS[current].ipc_value = msg_value;
-        PROCS[current].state = ProcessState::BlockedCall;
-
-        schedule(frame, current);
-    }
-}
-
-/// SYS_REPLY(target_pid, reply_value) — deliver reply to a SYS_CALL caller.
-///
-/// Convention: a0 = caller PID, a1 = reply value.
-/// Returns:    a0 = 0 (success), usize::MAX (error).
-///
-/// Non-blocking for the server — it continues running after replying.
-/// The target must be in BlockedCall state and must have called US.
-/// This prevents random processes from replying to calls they didn't receive.
-pub fn sys_reply(frame: &mut TrapFrame) {
-    frame.sepc += 4;
-
-    let current = unsafe { CURRENT_PID };
-    let target_pid = frame.a0;
-    let reply_value = frame.a1;
-
-    // Validate target
-    if target_pid == 0 || target_pid >= MAX_PROCS || target_pid == current {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    unsafe {
-        // Target must be BlockedCall AND must have called us
-        if PROCS[target_pid].state == ProcessState::BlockedCall
-            && PROCS[target_pid].ipc_target == current
-        {
-            // Deliver reply to caller's saved context
-            PROCS[target_pid].context.a0 = reply_value;
-            PROCS[target_pid].state = ProcessState::Ready;
-
-            // Server continues — non-blocking
-            frame.a0 = 0;
-            return;
-        }
-
-        // No matching BlockedCall — error
-        frame.a0 = usize::MAX;
-    }
-}
-
-// ── Memory Management Syscalls ────────────────────────────────
-
-/// SYS_MAP(phys, virt, flags) — map a physical page into caller's address space.
-///
-/// Convention: a0 = physical address, a1 = virtual address, a2 = flags.
-///   flags: 0 = USER_RW, 1 = USER_RX
-/// Returns: a0 = 0 (success), usize::MAX (error).
-///
-/// Validates:
-///   - phys and virt are page-aligned
-///   - virt is in user-mappable range (not kernel space)
-///   - phys was allocated via SYS_ALLOC_PAGES
-pub fn sys_map(frame: &mut TrapFrame) {
-    frame.sepc += 4;
-
-    let phys = frame.a0;
-    let virt = frame.a1;
-    let flags_arg = frame.a2;
-
-    // Validate alignment
-    if phys % PAGE_SIZE != 0 || virt % PAGE_SIZE != 0 {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    // Validate virt is in user range (below kernel space).
-    // Reject addresses in kernel region and MMIO regions.
-    // Simple check: user VA must be >= 0x5000_0000 and < 0x8000_0000
-    // (avoids UART at 0x1000_0000, PLIC at 0x0C00_0000, kernel at 0x8020_0000+)
-    if virt < 0x5000_0000 || virt >= 0x8000_0000 {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    // Validate phys is an allocated page
-    let alloc = unsafe { crate::page_alloc::get() };
-    if !alloc.is_allocated(phys) {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    // Map flags: 0 = USER_RW, 1 = USER_RX
-    let pte_flags = match flags_arg {
-        0 => crate::page_table::USER_RW,
-        1 => crate::page_table::USER_RX,
-        _ => {
-            frame.a0 = usize::MAX;
-            return;
-        }
-    };
-
-    // Get current process's page table root
-    let current = unsafe { CURRENT_PID };
-    let satp = unsafe { PROCS[current].satp };
-    let root = kvm::satp_to_root(satp);
-
-    // Map the page
-    kvm::map_user_page(root, virt, phys, pte_flags);
-
-    // Flush TLB for this VA
-    unsafe {
-        core::arch::asm!("sfence.vma {}, zero", in(reg) virt);
-    }
-
-    frame.a0 = 0;
-}
-
-/// SYS_UNMAP(virt) — remove a page mapping from caller's address space.
-///
-/// Convention: a0 = virtual address.
-/// Returns: a0 = 0 (success), usize::MAX (error).
-///
-/// Does NOT free the physical page — use SYS_FREE_PAGES for that.
-pub fn sys_unmap(frame: &mut TrapFrame) {
-    frame.sepc += 4;
-
-    let virt = frame.a0;
-
-    if virt % PAGE_SIZE != 0 {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    // SECURITY: Only allow unmapping user-range VAs.
-    // Prevent user from unmapping kernel text/data/stack/MMIO pages
-    // from their own page table — that would crash the kernel on next trap.
-    if virt < 0x5000_0000 || virt >= 0x8000_0000 {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    let current = unsafe { CURRENT_PID };
-    let satp = unsafe { PROCS[current].satp };
-    let root = kvm::satp_to_root(satp);
-
-    if kvm::unmap_page(root, virt) {
-        // Flush TLB for this VA
-        unsafe {
-            core::arch::asm!("sfence.vma {}, zero", in(reg) virt);
-        }
-        frame.a0 = 0;
-    } else {
-        frame.a0 = usize::MAX;
-    }
-}
-
-/// SYS_ALLOC_PAGES(count) — allocate physical pages.
-///
-/// Convention: a0 = count (must be 1 for now).
-/// Returns: a0 = physical address of allocated page, usize::MAX on error.
-///
-/// The page is zeroed before returning. Caller must SYS_MAP it
-/// before accessing it — the page is not automatically mapped.
-pub fn sys_alloc_pages(frame: &mut TrapFrame) {
-    frame.sepc += 4;
-
-    let count = frame.a0;
-
-    // Only single-page allocations for now
-    if count != 1 {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    let alloc = unsafe { crate::page_alloc::get() };
-    match alloc.alloc() {
-        Ok(phys) => {
-            unsafe { crate::page_alloc::BitmapAllocator::zero_page(phys); }
-            frame.a0 = phys;
-        }
-        Err(_) => {
-            frame.a0 = usize::MAX;
-        }
-    }
-}
-
-/// SYS_FREE_PAGES(phys, count) — return physical pages to the kernel.
-///
-/// Convention: a0 = physical address, a1 = count (must be 1 for now).
-/// Returns: a0 = 0 (success), usize::MAX (error).
-///
-/// The page is zeroed (security: don't leak data between processes).
-/// Caller should SYS_UNMAP first if the page is still mapped.
-pub fn sys_free_pages(frame: &mut TrapFrame) {
-    frame.sepc += 4;
-
-    let phys = frame.a0;
-    let count = frame.a1;
-
-    if count != 1 {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    // Validate alignment
-    if phys % PAGE_SIZE != 0 {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    // SECURITY: Verify the page is actually allocated before zeroing.
-    // Without this, a malicious process could pass a kernel page table
-    // address and zero_page would destroy it before free() rejects it.
-    let alloc = unsafe { crate::page_alloc::get() };
-    if !alloc.is_allocated(phys) {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    // Zero the page before freeing (prevent data leaks between processes)
-    unsafe { crate::page_alloc::BitmapAllocator::zero_page(phys); }
-
-    match alloc.free(phys) {
-        Ok(()) => {
-            frame.a0 = 0;
-        }
-        Err(_) => {
-            frame.a0 = usize::MAX;
-        }
-    }
-}
-
-// ── IRQ Syscalls (Phase 13) ───────────────────────────────────
-
-/// SYS_IRQ_REGISTER(irq_num) — claim ownership of a hardware interrupt.
-///
-/// Convention: a0 = IRQ number.
-/// Returns: a0 = 0 (success), usize::MAX (error: invalid IRQ or already claimed).
-///
-/// After registration, when this IRQ fires at the PLIC, the kernel delivers
-/// it as an IPC message (sender=0, msg=irq_num) to this process's SYS_RECEIVE.
-/// Only one process can own an IRQ at a time.
-pub fn sys_irq_register(frame: &mut TrapFrame) {
-    frame.sepc += 4;
-
-    let current = unsafe { CURRENT_PID };
-    let irq = frame.a0 as u32;
-
-    if (irq as usize) >= MAX_IRQS {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    unsafe {
-        // Check if already claimed
-        if IRQ_OWNER[irq as usize] != 0 {
-            frame.a0 = usize::MAX;
-            return;
-        }
-
-        IRQ_OWNER[irq as usize] = current;
-        PROCS[current].irq_num = irq;
-    }
-
-    // Enable this IRQ at the PLIC now that a process owns it.
-    // Before this, the PLIC ignores the IRQ even if the device asserts it.
-    crate::plic::enable_irq(irq);
-
-    println!("  [kernel] PID {} registered for IRQ {}", current, irq);
-    frame.a0 = 0;
-}
-
-/// SYS_IRQ_ACK() — acknowledge completion of interrupt handling.
-///
-/// Convention: no arguments.
-/// Returns: a0 = 0 (success), usize::MAX (error: no registered IRQ).
-///
-/// Completes the PLIC cycle for the process's registered IRQ.
-/// The PLIC won't deliver the next instance of this IRQ until acknowledged.
-/// Must be called after handling an IRQ notification from SYS_RECEIVE.
-pub fn sys_irq_ack(frame: &mut TrapFrame) {
-    frame.sepc += 4;
-
-    let current = unsafe { CURRENT_PID };
-    let irq = unsafe { PROCS[current].irq_num };
-
-    if irq == 0 {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    // Complete the PLIC claim/complete cycle
-    crate::plic::complete(irq);
-    frame.a0 = 0;
-}
-
-// ── IRQ Helpers ──────────────────────────────────────────────
-
-/// Look up the owning PID for an IRQ. Returns 0 if unclaimed.
-pub fn irq_owner(irq: u32) -> usize {
-    if (irq as usize) >= MAX_IRQS { return 0; }
-    unsafe { IRQ_OWNER[irq as usize] }
-}
-
-/// Deliver an IRQ notification to the owning process.
-///
-/// If the process is in BlockedRecv: deliver immediately as a synthetic
-/// IPC message (sender=0, msg=irq_num), mark Ready.
-/// If not: set irq_pending flag — next SYS_RECEIVE returns immediately.
-pub fn irq_notify(irq: u32, owner: usize) {
-    unsafe {
-        if PROCS[owner].state == ProcessState::BlockedRecv {
-            // Deliver immediately — overwrite the saved context
-            PROCS[owner].context.a0 = irq as usize;  // message = IRQ number
-            PROCS[owner].context.a1 = 0;              // sender = kernel (PID 0)
-            PROCS[owner].state = ProcessState::Ready;
-        } else {
-            // Process not ready to receive — queue for later
-            PROCS[owner].irq_pending = true;
-        }
-    }
-}
-
-// ── Process Spawn ─────────────────────────────────────────────
-
-/// SYS_SPAWN(elf_ptr, elf_len) — create a new process from an ELF binary.
-///
-/// Convention: a0 = pointer to ELF data (in caller's memory), a1 = length.
-/// Returns: a0 = new PID, usize::MAX on error.
-///
-/// Parses the ELF, allocates pages for each LOAD segment, copies data,
-/// builds a user page table, and registers the process as Ready.
-pub fn sys_spawn(frame: &mut TrapFrame) {
-    frame.sepc += 4;
-
-    let elf_ptr = frame.a0;
-    let elf_len = frame.a1;
-    let parent = unsafe { CURRENT_PID };
-
-    // Basic validation
-    if elf_len == 0 || elf_len > 1024 * 1024 {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    // Enable Supervisor User Memory access (SUM bit in sstatus).
-    // Without this, S-mode cannot read pages with the U bit set.
-    // trap.S will restore the original sstatus before sret, so
-    // this only affects the current trap handling.
-    unsafe { asm!("csrs sstatus, {}", in(reg) 1usize << 18); }
-
-    // Read the ELF data from caller's address space
-    let elf_data = unsafe {
-        core::slice::from_raw_parts(elf_ptr as *const u8, elf_len)
-    };
-
-    // Parse ELF headers
-    let info = match crate::elf::parse(elf_data) {
-        Ok(info) => info,
-        Err(_) => {
-            frame.a0 = usize::MAX;
-            return;
-        }
-    };
-
-    // Find a free process slot
-    let mut new_pid = 0;
-    unsafe {
-        for i in 1..MAX_PROCS {
-            if PROCS[i].state == ProcessState::Free {
-                new_pid = i;
-                break;
-            }
-        }
-    }
-    if new_pid == 0 {
-        frame.a0 = usize::MAX;
-        return;
-    }
-
-    // Build user page table
-    let user_root = kvm::alloc_zeroed_page();
-    kvm::map_kernel_regions(user_root);
-
-    // Load each segment
-    for seg_idx in 0..info.num_segments {
-        let seg = &info.segments[seg_idx];
-        let flags = if seg.executable { USER_RX } else { USER_RW };
-
-        let num_pages = crate::elf::pages_needed(seg.memsz, seg.vaddr);
-        let base_va = seg.vaddr & !(PAGE_SIZE - 1);
-
-        for p in 0..num_pages {
-            let va = base_va + p * PAGE_SIZE;
-            let page = kvm::alloc_zeroed_page();
-
-            // Calculate how much of this page needs file data
-            let page_start = va;
-            let page_end = va + PAGE_SIZE;
-
-            let seg_file_start = seg.vaddr;
-            let seg_file_end = seg.vaddr + seg.filesz;
-
-            // Overlap between [page_start..page_end] and [seg_file_start..seg_file_end]
-            let copy_start = if seg_file_start > page_start { seg_file_start } else { page_start };
-            let copy_end = if seg_file_end < page_end { seg_file_end } else { page_end };
-
-            if copy_start < copy_end {
-                let file_offset = seg.file_offset + (copy_start - seg.vaddr);
-                let dst_offset = copy_start - page_start;
-                let len = copy_end - copy_start;
-
-                unsafe {
-                    let src = elf_data.as_ptr().add(file_offset);
-                    let dst = (page as *mut u8).add(dst_offset);
-                    for b in 0..len {
-                        core::ptr::write_volatile(dst.add(b), core::ptr::read_volatile(src.add(b)));
-                    }
-                }
-            }
-            // memsz > filesz portion is already zeroed (alloc_zeroed_page)
-
-            kvm::map_user_page(user_root, va, page, flags);
-        }
-    }
-
-    // Allocate user stack (one page)
-    let user_stack = kvm::alloc_zeroed_page();
-    let stack_va = 0x7FFF_0000; // Fixed stack VA for spawned processes
-    kvm::map_user_page(user_root, stack_va, user_stack, USER_RW);
-    let user_sp = stack_va + PAGE_SIZE;
-
-    let satp = make_satp(user_root, new_pid as u16);
-
-    // Set up initial context
-    let mut ctx = TrapFrame::zero();
-    ctx.sepc = info.entry;
-    ctx.sp = user_sp;
-    ctx.sstatus = 1 << 5; // SPIE=1, SPP=0 (U-mode)
-
-    unsafe {
-        PROCS[new_pid] = Process {
-            pid: new_pid,
-            state: ProcessState::Ready,
-            satp,
-            context: ctx,
-            ipc_target: 0,
-            ipc_value: 0,
-            parent,
-            exit_code: 0,
-            irq_num: 0,
-            irq_pending: false,
-        };
-    }
-
-    println!("  [kernel] PID {} spawned by PID {} (entry={:#x})",
-        new_pid, parent, info.entry);
-
-    frame.a0 = new_pid;
-}
-
 /// Kernel-level spawn for boot processes (not via syscall).
 /// Used by launch() to create initial processes from embedded assembly.
 fn create_process(
@@ -1343,6 +827,8 @@ fn create_process(
             context: ctx,
             ipc_target: 0,
             ipc_value: 0,
+            ipc_arg2: 0,
+            ipc_arg3: 0,
             parent: 0,
             exit_code: 0,
             irq_num: 0,
@@ -1427,6 +913,8 @@ fn create_process_from_elf(
             context: ctx,
             ipc_target: 0,
             ipc_value: 0,
+            ipc_arg2: 0,
+            ipc_arg3: 0,
             parent: 0,
             exit_code: 0,
             irq_num: 0,
@@ -1436,123 +924,6 @@ fn create_process_from_elf(
 
     println!("  [proc] PID {} created from ELF (entry={:#x}, {} segments, sp={:#x})",
         pid, info.entry, info.num_segments, user_sp);
-}
-
-// ── IPC Syscall Handlers ──────────────────────────────────────
-
-/// SYS_SEND(target_pid, msg_value) — synchronous send.
-///
-/// Convention: a0 = target PID, a1 = message value.
-/// Returns: a0 = 0 (success).
-///
-/// Blocks the sender until the target calls SYS_RECEIVE.
-/// If the target is already blocked on RECEIVE, rendezvous immediately.
-pub fn sys_send(frame: &mut TrapFrame) {
-    frame.sepc += 4; // advance past ecall
-
-    let current = unsafe { CURRENT_PID };
-    let target_pid = frame.a0;
-    let msg_value = frame.a1;
-
-    // Validate target
-    if target_pid == 0 || target_pid >= MAX_PROCS || target_pid == current {
-        frame.a0 = usize::MAX; // error
-        return;
-    }
-
-    unsafe {
-        let target_state = PROCS[target_pid].state;
-        let target_wants = PROCS[target_pid].ipc_target;
-
-        // Check if target is blocked on RECEIVE (from us or from any)
-        if target_state == ProcessState::BlockedRecv
-            && (target_wants == 0 || target_wants == current)
-        {
-            // Rendezvous! Transfer message directly to receiver's saved context.
-            PROCS[target_pid].context.a0 = msg_value;     // message
-            PROCS[target_pid].context.a1 = current;        // sender PID
-            PROCS[target_pid].state = ProcessState::Ready;
-
-            // Sender continues — send returns success
-            frame.a0 = 0;
-            return;
-        }
-
-        // No rendezvous — block the sender
-        PROCS[current].ipc_target = target_pid;
-        PROCS[current].ipc_value = msg_value;
-        PROCS[current].state = ProcessState::BlockedSend;
-
-        // Context switch to the next ready process
-        schedule(frame, current);
-    }
-}
-
-/// SYS_RECEIVE(from_pid) — synchronous receive.
-///
-/// Convention: a0 = expected sender PID (0 = accept from anyone).
-/// Returns: a0 = message value, a1 = sender PID.
-///
-/// Blocks the receiver until someone calls SYS_SEND targeting us.
-/// If a sender is already blocked, rendezvous immediately.
-pub fn sys_receive(frame: &mut TrapFrame) {
-    frame.sepc += 4;
-
-    let current = unsafe { CURRENT_PID };
-    let from_pid = frame.a0; // 0 = any
-
-    unsafe {
-        // Phase 13: Check for pending IRQ before checking senders.
-        // If an IRQ fired while we weren't in BlockedRecv, irq_pending is set.
-        // Return it immediately as a synthetic IPC message (sender=0, msg=irq_num).
-        if PROCS[current].irq_pending && (from_pid == 0) {
-            PROCS[current].irq_pending = false;
-            frame.a0 = PROCS[current].irq_num as usize;  // message = IRQ number
-            frame.a1 = 0;                                  // sender = kernel (PID 0)
-            return;
-        }
-
-        // Check if any sender is blocked waiting to send to us.
-        // Match both BlockedSend (from SYS_SEND) and BlockedCall (from SYS_CALL).
-        // The server's RECEIVE doesn't care how the sender sent — it gets the
-        // message either way. The difference is what happens when the server
-        // replies: BlockedSend processes were already unblocked, BlockedCall
-        // processes stay blocked until SYS_REPLY delivers the response.
-        for i in 1..MAX_PROCS {
-            let is_sender = PROCS[i].state == ProcessState::BlockedSend
-                || PROCS[i].state == ProcessState::BlockedCall;
-
-            if is_sender
-                && PROCS[i].ipc_target == current
-                && (from_pid == 0 || from_pid == i)
-            {
-                // Rendezvous! Transfer message.
-                let msg = PROCS[i].ipc_value;
-                let sender = i;
-
-                // Unblock sender ONLY if it was a plain SEND.
-                // BlockedCall stays blocked — it's waiting for SYS_REPLY.
-                if PROCS[i].state == ProcessState::BlockedSend {
-                    PROCS[i].state = ProcessState::Ready;
-                    PROCS[i].context.a0 = 0; // send returns 0
-                }
-                // BlockedCall: leave state as BlockedCall, target stays set.
-                // SYS_REPLY will unblock it later.
-
-                // Receiver gets the message
-                frame.a0 = msg;
-                frame.a1 = sender;
-                return;
-            }
-        }
-
-        // No sender found — block the receiver
-        PROCS[current].ipc_target = from_pid;
-        PROCS[current].state = ProcessState::BlockedRecv;
-
-        // Context switch to the next ready process
-        schedule(frame, current);
-    }
 }
 
 /// SYS_EXIT(code) — terminate the current process.
@@ -1573,7 +944,7 @@ pub fn sys_exit(frame: &mut TrapFrame) {
         // Phase 13: Clean up IRQ ownership
         if PROCS[current].irq_num != 0 {
             let irq = PROCS[current].irq_num;
-            if (irq as usize) < MAX_IRQS {
+            if security::is_valid_irq(irq as usize) {
                 IRQ_OWNER[irq as usize] = 0;
             }
             PROCS[current].irq_num = 0;
@@ -1678,7 +1049,7 @@ pub fn sys_wait(frame: &mut TrapFrame) {
     let child_pid = frame.a0;
 
     // Validate
-    if child_pid == 0 || child_pid >= MAX_PROCS || child_pid == current {
+    if !security::is_valid_ipc_target(child_pid, current) {
         frame.a0 = usize::MAX;
         return;
     }
@@ -1817,7 +1188,7 @@ pub fn schedule_from_idle(frame: &mut TrapFrame) {
 /// The frame on the kernel stack is overwritten with the next process's
 /// saved context. When we return to trap.S, it restores and srets to
 /// the next process.
-unsafe fn schedule(frame: &mut TrapFrame, blocked_pid: usize) {
+pub(crate) unsafe fn schedule(frame: &mut TrapFrame, blocked_pid: usize) {
     // Save current process's registers
     PROCS[blocked_pid].context = *frame;
 

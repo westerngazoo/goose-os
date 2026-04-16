@@ -30,6 +30,10 @@ mod kvm;
 #[cfg(not(test))]
 mod process;
 #[cfg(not(test))]
+mod ipc;
+#[cfg(not(test))]
+mod syscall;
+#[cfg(not(test))]
 mod elf;
 #[allow(dead_code)]
 mod security;
@@ -40,6 +44,14 @@ mod interp;
 #[allow(dead_code)]
 mod wasi;
 
+// Phase B: Networking modules
+#[cfg(not(test))]
+mod driver;
+#[cfg(all(not(test), feature = "net"))]
+mod virtio;
+#[cfg(all(not(test), feature = "net"))]
+mod net;
+
 
 // ── Kernel code (only compiled for RISC-V target, not during host tests) ──
 
@@ -47,6 +59,8 @@ mod wasi;
 mod kernel {
     use core::arch::{asm, global_asm};
     use crate::{page_alloc, kvm, process, println, platform, trap, plic, uart, wasi};
+    #[cfg(feature = "net")]
+    use crate::driver::NetworkDevice;
 
     // Include the RISC-V assembly boot code.
     global_asm!(include_str!("boot.S"));
@@ -129,6 +143,37 @@ mod kernel {
         println!("  [page_alloc] {} pages used for page tables, {} free",
             alloc.allocated_count(), alloc.free_count());
         println!();
+
+        // === Phase B: VirtIO device discovery + network init ===
+        #[cfg(feature = "net")]
+        {
+            println!("  [virtio] Probing VirtIO MMIO devices...");
+            if let Some((slot, irq)) = crate::virtio::probe_all() {
+                println!("  [virtio] Found virtio-net at slot {} (IRQ {})", slot, irq);
+                match crate::virtio::init_device() {
+                    Ok(()) => {
+                        let mac = unsafe { crate::virtio::get().mac_address() };
+                        println!("  [virtio] virtio-net initialized (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+                        // Enable VirtIO IRQ at PLIC
+                        plic::enable_irq(irq);
+
+                        // Initialize smoltcp
+                        crate::net::init();
+                        println!("  [net] Network stack initialized (10.0.2.15/24, gw 10.0.2.2)");
+
+                        // Kernel smoke test: send a UDP packet to the gateway.
+                        // Proves smoltcp -> VirtIO TX round-trip works.
+                        crate::net::smoke_test();
+                    }
+                    Err(e) => println!("  [virtio] Init failed: {:?}", e),
+                }
+            } else {
+                println!("  [virtio] No virtio-net device found");
+            }
+            println!();
+        }
 
         // === Phase 16: WASM test mode ===
         // If wasm-test feature is active, run the WASM interpreter instead

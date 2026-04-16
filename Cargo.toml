@@ -3,6 +3,15 @@ name = "goose-os"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+smoltcp = { version = "0.12", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+], optional = true }
+
 [features]
 default = ["qemu"]
 qemu = []
@@ -11,6 +20,7 @@ security-test = ["qemu"]  # Boots security test process instead of normal init
 wasm-test = []            # Runs WASM/WASI hello world via interpreter (no userspace)
 rust-user = []            # Boot compiled Rust ELF binary as PID 1 (no assembly userspace)
 debug-kernel = []          # Enable kdebug!/kdump macros (verbose kernel tracing)
+net = ["qemu", "dep:smoltcp"]  # VirtIO-net + smoltcp TCP/IP stack
 
 [profile.dev]
 panic = "abort"

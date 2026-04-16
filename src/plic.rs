@@ -28,11 +28,20 @@ pub fn init() {
         // Set UART0 priority = 1 (above threshold → eligible for delivery)
         ptr::write_volatile(priority_addr(UART0_IRQ) as *mut u32, 1);
 
+        // Set priority=1 for all VirtIO MMIO IRQs (1-8)
+        #[cfg(feature = "qemu")]
+        for irq in platform::VIRTIO_IRQ_BASE..platform::VIRTIO_IRQ_BASE + platform::VIRTIO_MMIO_SLOTS as u32 {
+            ptr::write_volatile(priority_addr(irq) as *mut u32, 1);
+        }
+
         // Accept all priorities > 0
         ptr::write_volatile(THRESHOLD as *mut u32, 0);
     }
 
     println!("  [plic] UART0 (IRQ {}) priority=1, context={}, threshold=0", UART0_IRQ, CONTEXT);
+    #[cfg(feature = "qemu")]
+    println!("  [plic] VirtIO IRQs {}-{} priority=1", platform::VIRTIO_IRQ_BASE,
+        platform::VIRTIO_IRQ_BASE + platform::VIRTIO_MMIO_SLOTS as u32 - 1);
     println!("  [plic] IRQ routing deferred until SYS_IRQ_REGISTER");
 }
 
