@@ -287,6 +287,77 @@ pub fn reboot() -> ! {
     }
 }
 
+// ── Network IPC (Phase B) ────────────────────────────────────
+//
+// The kernel net server lives at PID 3 and is invoked via SYS_CALL.
+// Register convention:
+//   a7 = SYS_CALL (4)
+//   a0 = 3  (NET_SERVER_PID)  — returns result
+//   a1 = opcode
+//   a2 = arg1
+//   a3 = arg2
+//   a4 = arg3
+
+pub mod net {
+    use core::arch::asm;
+
+    const NET_PID: usize = 3;
+    const SYS_CALL: usize = 4;
+
+    // Opcodes — must match kernel src/net.rs.
+    pub const NET_STATUS: usize = 0;
+    pub const NET_SOCKET_TCP: usize = 1;
+    pub const NET_SOCKET_UDP: usize = 2;
+    pub const NET_BIND: usize = 3;
+    pub const NET_CONNECT: usize = 4;
+    pub const NET_LISTEN: usize = 5;
+    pub const NET_ACCEPT: usize = 6;
+    pub const NET_SEND: usize = 7;
+    pub const NET_RECV: usize = 8;
+    pub const NET_CLOSE: usize = 9;
+
+    const ERR: usize = usize::MAX;
+
+    /// Raw 3-argument call into the net server.
+    #[inline(always)]
+    fn ncall(opcode: usize, a1: usize, a2: usize, a3: usize) -> Result<usize, ()> {
+        let ret: usize;
+        unsafe {
+            asm!(
+                "ecall",
+                in("a7") SYS_CALL,
+                inlateout("a0") NET_PID => ret,
+                in("a1") opcode,
+                in("a2") a1,
+                in("a3") a2,
+                in("a4") a3,
+                options(nostack),
+            );
+        }
+        if ret == ERR { Err(()) } else { Ok(ret) }
+    }
+
+    /// Query whether the network stack is up. Returns 1 if ready.
+    pub fn status() -> Result<usize, ()> {
+        ncall(NET_STATUS, 0, 0, 0)
+    }
+
+    /// Create a new UDP socket. Returns an opaque socket handle.
+    pub fn socket_udp() -> Result<usize, ()> {
+        ncall(NET_SOCKET_UDP, 0, 0, 0)
+    }
+
+    /// Bind a UDP socket to a local port.
+    pub fn bind(handle: usize, port: u16) -> Result<(), ()> {
+        ncall(NET_BIND, handle, port as usize, 0).map(|_| ())
+    }
+
+    /// Close a socket.
+    pub fn close(handle: usize) -> Result<(), ()> {
+        ncall(NET_CLOSE, handle, 0, 0).map(|_| ())
+    }
+}
+
 // ── Console Output (println! via SYS_PUTCHAR) ────────────────
 
 struct SyscallWriter;
