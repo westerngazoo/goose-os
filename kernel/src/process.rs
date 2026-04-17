@@ -696,7 +696,7 @@ pub fn launch() -> ! {
     {
         // Compiled Rust userspace binary (built by: make build-user)
         static HELLO_ELF: &[u8] = include_bytes!(
-            "../user/hello/target/riscv64gc-unknown-none-elf/release/hello"
+            "../../userspace/hello/target/riscv64gc-unknown-none-elf/release/hello"
         );
 
         println!("  [proc] === RUST USERSPACE MODE ===");

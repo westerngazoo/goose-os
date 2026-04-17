@@ -13,7 +13,7 @@ goose() {
             git pull || { echo "ERROR: git pull failed"; return 1; }
             local build=$(cat .build_number 2>/dev/null || echo "?")
             echo "Copying kernel.bin (build $build) to /boot/..."
-            cp kernel.bin /boot/kernel.bin || { echo "ERROR: cp failed"; return 1; }
+            cp build/kernel.bin /boot/kernel.bin || { echo "ERROR: cp failed"; return 1; }
             echo ""
             echo "  Build $build ready in /boot/kernel.bin"
             echo "  Run 'goose reboot' to boot into it"

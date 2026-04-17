@@ -474,3 +474,133 @@ mod tests {
         assert_eq!(asid, 0);
     }
 }
+
+// ── Kani Proofs ─────────────────────────────────────────────────
+//
+// Machine-checked verification of page table invariants.
+// Run with: cargo kani --harness <name>
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// va_parts → va_from_parts is identity for any 39-bit virtual address.
+    #[kani::proof]
+    fn proof_va_roundtrip() {
+        let va: usize = kani::any();
+        // Constrain to valid 39-bit address space
+        kani::assume(va < (1 << 39));
+
+        let (vpn2, vpn1, vpn0, offset) = va_parts(va);
+        let reconstructed = va_from_parts(vpn2, vpn1, vpn0, offset);
+        assert_eq!(reconstructed, va);
+    }
+
+    /// va_parts produces valid VPN indices (< 512) and offset (< 4096).
+    #[kani::proof]
+    fn proof_va_parts_bounds() {
+        let va: usize = kani::any();
+        let (vpn2, vpn1, vpn0, offset) = va_parts(va);
+        assert!(vpn2 < PT_ENTRIES);
+        assert!(vpn1 < PT_ENTRIES);
+        assert!(vpn0 < PT_ENTRIES);
+        assert!(offset < PAGE_SIZE);
+    }
+
+    /// PTE encode/decode: phys_addr round-trips for page-aligned addresses.
+    #[kani::proof]
+    fn proof_pte_phys_roundtrip() {
+        let pa: usize = kani::any();
+        // Constrain to page-aligned, within 56-bit physical address space
+        kani::assume(pa % PAGE_SIZE == 0);
+        kani::assume(pa < (1usize << 56));
+
+        let pte = Pte::new(pa, KERNEL_RW);
+        assert_eq!(pte.phys_addr(), pa);
+    }
+
+    /// PTE flags are preserved through encode/decode.
+    #[kani::proof]
+    fn proof_pte_flags_roundtrip() {
+        let pa: usize = kani::any();
+        kani::assume(pa % PAGE_SIZE == 0);
+        kani::assume(pa < (1usize << 56));
+
+        let flags = KERNEL_RX;
+        let pte = Pte::new(pa, flags);
+        assert_eq!(pte.flags(), flags);
+    }
+
+    /// Branch PTEs are valid and non-leaf.
+    #[kani::proof]
+    fn proof_branch_pte_invariants() {
+        let table_pa: usize = kani::any();
+        kani::assume(table_pa % PAGE_SIZE == 0);
+        kani::assume(table_pa < (1usize << 56));
+
+        let pte = Pte::branch(table_pa);
+        assert!(pte.is_valid());
+        assert!(pte.is_branch());
+        assert!(!pte.is_leaf());
+        assert_eq!(pte.phys_addr(), table_pa);
+    }
+
+    /// make_satp roundtrip: extract root physical address back.
+    #[kani::proof]
+    fn proof_satp_roundtrip() {
+        let root: usize = kani::any();
+        let asid: u16 = kani::any();
+        kani::assume(root % PAGE_SIZE == 0);
+        kani::assume(root < (1usize << 56));
+
+        let satp = make_satp(root, asid);
+        // satp_to_root logic (from kvm.rs): ((satp & mask) << 12)
+        let extracted = ((satp & 0x0000_0FFF_FFFF_FFFF) << 12) as usize;
+        assert_eq!(extracted, root);
+    }
+
+    /// W^X: kernel permission sets never have both WRITE and EXECUTE.
+    #[kani::proof]
+    fn proof_kernel_wx_separation() {
+        assert!(!KERNEL_RX.contains(PteFlags::WRITE));
+        assert!(!KERNEL_RW.contains(PteFlags::EXECUTE));
+        assert!(!KERNEL_RO.contains(PteFlags::WRITE));
+        assert!(!KERNEL_RO.contains(PteFlags::EXECUTE));
+        assert!(!KERNEL_MMIO.contains(PteFlags::EXECUTE));
+    }
+
+    /// User permission sets never have both WRITE and EXECUTE.
+    #[kani::proof]
+    fn proof_user_wx_separation() {
+        assert!(!USER_RX.contains(PteFlags::WRITE));
+        assert!(!USER_RW.contains(PteFlags::EXECUTE));
+        assert!(!USER_MMIO.contains(PteFlags::EXECUTE));
+    }
+
+    /// Kernel permission sets never have the USER bit.
+    #[kani::proof]
+    fn proof_kernel_no_user_bit() {
+        assert!(!KERNEL_RX.contains(PteFlags::USER));
+        assert!(!KERNEL_RW.contains(PteFlags::USER));
+        assert!(!KERNEL_RO.contains(PteFlags::USER));
+        assert!(!KERNEL_MMIO.contains(PteFlags::USER));
+    }
+
+    /// User permission sets always have the USER bit.
+    #[kani::proof]
+    fn proof_user_has_user_bit() {
+        assert!(USER_RX.contains(PteFlags::USER));
+        assert!(USER_RW.contains(PteFlags::USER));
+        assert!(USER_MMIO.contains(PteFlags::USER));
+    }
+
+    /// PteFlags union is a monoid: NONE is identity.
+    #[kani::proof]
+    fn proof_flags_monoid_identity() {
+        let bits: u64 = kani::any();
+        kani::assume(bits < (1 << 10));
+        let f = PteFlags(bits);
+        assert_eq!(f.union(PteFlags::NONE), f);
+        assert_eq!(PteFlags::NONE.union(f), f);
+    }
+}

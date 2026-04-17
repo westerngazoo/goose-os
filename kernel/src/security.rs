@@ -9,11 +9,13 @@
 
 use crate::page_alloc::PAGE_SIZE;
 
-/// Maximum number of processes (must match process.rs).
-const MAX_PROCS: usize = 8;
+/// Maximum number of processes — single source of truth.
+/// Used by process.rs (process table bounds) and security checks below.
+pub const MAX_PROCS: usize = 8;
 
-/// Maximum number of IRQs (must match process.rs).
-const MAX_IRQS: usize = 64;
+/// Maximum number of IRQs — single source of truth.
+/// Used by process.rs (IRQ ownership table) and security checks below.
+pub const MAX_IRQS: usize = 64;
 
 /// User VA range boundaries.
 ///
@@ -428,5 +430,99 @@ mod tests {
     fn test_attack_spawn_huge_elf() {
         // Attacker passes huge ELF size hoping to read kernel memory
         assert!(!is_valid_elf_size(usize::MAX));
+    }
+}
+
+// ── Kani Proofs ─────────────────────────────────────────────────
+//
+// Machine-checked verification of security predicates.
+// Run with: cargo kani --harness <name>
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// is_user_va rejects all kernel addresses (>= 0x8000_0000).
+    #[kani::proof]
+    fn proof_user_va_rejects_kernel() {
+        let va: usize = kani::any();
+        kani::assume(va >= 0x8000_0000);
+        assert!(!is_user_va(va));
+    }
+
+    /// is_user_va rejects all low addresses (< 0x5000_0000), including MMIO.
+    #[kani::proof]
+    fn proof_user_va_rejects_low() {
+        let va: usize = kani::any();
+        kani::assume(va < 0x5000_0000);
+        assert!(!is_user_va(va));
+    }
+
+    /// is_user_va accepts exactly the range [USER_VA_START, USER_VA_END).
+    #[kani::proof]
+    fn proof_user_va_exact_range() {
+        let va: usize = kani::any();
+        let result = is_user_va(va);
+        assert_eq!(result, va >= USER_VA_START && va < USER_VA_END);
+    }
+
+    /// is_page_aligned iff low 12 bits are zero.
+    #[kani::proof]
+    fn proof_page_aligned_iff_low_bits_zero() {
+        let addr: usize = kani::any();
+        assert_eq!(is_page_aligned(addr), addr & 0xFFF == 0);
+    }
+
+    /// is_valid_ipc_target rejects PID 0 (kernel).
+    #[kani::proof]
+    fn proof_ipc_rejects_kernel() {
+        let current: usize = kani::any();
+        assert!(!is_valid_ipc_target(0, current));
+    }
+
+    /// is_valid_ipc_target rejects self-send.
+    #[kani::proof]
+    fn proof_ipc_rejects_self() {
+        let pid: usize = kani::any();
+        assert!(!is_valid_ipc_target(pid, pid));
+    }
+
+    /// is_valid_ipc_target rejects out-of-bounds PIDs.
+    #[kani::proof]
+    fn proof_ipc_rejects_oob() {
+        let target: usize = kani::any();
+        let current: usize = kani::any();
+        kani::assume(target >= MAX_PROCS);
+        assert!(!is_valid_ipc_target(target, current));
+    }
+
+    /// is_valid_map_flags accepts only {0, 1}.
+    #[kani::proof]
+    fn proof_map_flags_exact() {
+        let flags: usize = kani::any();
+        assert_eq!(is_valid_map_flags(flags), flags <= 1);
+    }
+
+    /// is_valid_irq accepts only [0, MAX_IRQS).
+    #[kani::proof]
+    fn proof_irq_range() {
+        let irq: usize = kani::any();
+        assert_eq!(is_valid_irq(irq), irq < MAX_IRQS);
+    }
+
+    /// is_valid_alloc_count accepts only 1.
+    #[kani::proof]
+    fn proof_alloc_count_exact() {
+        let count: usize = kani::any();
+        assert_eq!(is_valid_alloc_count(count), count == 1);
+    }
+
+    /// is_valid_elf_size accepts (0, 1MB].
+    #[kani::proof]
+    fn proof_elf_size_range() {
+        let len: usize = kani::any();
+        // Bound to avoid blowup — the logic is simple enough
+        kani::assume(len <= 2 * 1024 * 1024);
+        assert_eq!(is_valid_elf_size(len), len > 0 && len <= 1024 * 1024);
     }
 }
