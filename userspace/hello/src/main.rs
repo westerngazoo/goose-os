@@ -2,13 +2,14 @@
 #![no_main]
 #![allow(dead_code)]
 
-// GooseOS userspace hello — Phase B net test.
+// GooseOS userspace hello.
 //
-// Exercises the kernel net server (PID 3) via SYS_CALL:
-//   1. NET_STATUS  → verify stack is up
-//   2. NET_SOCKET_UDP → allocate a UDP socket, get a handle
-//   3. NET_BIND    → bind to port 9999
-//   4. NET_CLOSE   → release it
+// Without the `net` feature: plain "Hello from Rust userspace!" + exit.
+// With    the `net` feature: exercises the kernel net server (PID 3):
+//   NET_STATUS -> NET_SOCKET_UDP -> NET_BIND -> NET_CLOSE.
+//
+// The `net` feature on this crate must be matched by the kernel being
+// built with its own `net` feature, otherwise SYS_CALL to PID 3 hangs.
 
 use core::arch::global_asm;
 
@@ -22,6 +23,14 @@ pub extern "C" fn main() {
     println!("Hello from Rust userspace!");
     println!("My PID is {}", gooseos::getpid());
 
+    #[cfg(feature = "net")]
+    run_net_test();
+
+    gooseos::exit(0);
+}
+
+#[cfg(feature = "net")]
+fn run_net_test() {
     println!("[net-test] Calling NET_STATUS...");
     match gooseos::net::status() {
         Ok(v) => println!("[net-test] net up (status={})", v),
@@ -59,7 +68,6 @@ pub extern "C" fn main() {
     }
 
     println!("[net-test] PASS");
-    gooseos::exit(0);
 }
 
 #[panic_handler]

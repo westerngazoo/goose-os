@@ -46,6 +46,12 @@ objdump: build
 	rust-objdump -d $(KERNEL_ELF) | head -80
 
 # Debug kernel: enables kdebug!/kdump macros for verbose tracing.
+#
+# KNOWN ISSUE (as of nightly 2026-04): this target hits a rustc ICE in
+# lint_mod/check_mod_deathness when the `debug-kernel` feature is on.
+# The #![allow(dead_code)] workaround in main.rs dodges the default
+# build but not this one. Fix options: pin rust-toolchain to an older
+# nightly, or wait for upstream rustc fix.
 run-debug:
 	cd kernel && GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features debug-kernel
 	@echo $(NEXT_BUILD) > $(BUILD_FILE)
@@ -96,6 +102,12 @@ deploy-wasm:
 # Rust userspace: boots a compiled Rust ELF binary as PID 1.
 build-user:
 	cd userspace/hello && CARGO_ENCODED_RUSTFLAGS='-Clink-arg=-Tlinker.ld' cargo build --release
+
+# Same ELF, but with the `net` feature enabled so main.rs runs the
+# NET_STATUS / NET_SOCKET_UDP / NET_BIND / NET_CLOSE exercise.
+# Must be paired with a kernel built with `net` — see test-net-user.
+build-user-net:
+	cd userspace/hello && CARGO_ENCODED_RUSTFLAGS='-Clink-arg=-Tlinker.ld' cargo build --release --features net
 
 run-rust-user: build-user
 	cd kernel && GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features "qemu rust-user" --no-default-features
@@ -163,7 +175,7 @@ run-net-debug:
 	  -kernel $(KERNEL_ELF)
 
 # Run with rust-user + net + pcap capture (full userspace net test)
-test-net-user: build-user
+test-net-user: build-user-net
 	cd kernel && GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features "qemu rust-user net" --no-default-features
 	@echo $(NEXT_BUILD) > $(BUILD_FILE)
 	@echo "=== Rust Userspace Net Test ==="

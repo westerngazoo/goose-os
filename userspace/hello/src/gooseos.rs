@@ -298,6 +298,7 @@ pub fn reboot() -> ! {
 //   a3 = arg2
 //   a4 = arg3
 
+#[cfg(feature = "net")]
 pub mod net {
     use core::arch::asm;
 

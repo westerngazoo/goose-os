@@ -3,6 +3,13 @@ name = "hello"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Exercise the kernel net server (PID 3) — requires the kernel to be
+# built with the `net` feature too. Otherwise NET_STATUS hangs on IPC
+# to a non-existent PID.
+net = []
+
 [profile.release]
 panic = "abort"
 opt-level = "s"
