@@ -1,4 +1,16 @@
 [toolchain]
-channel = "nightly"
+# Pinned to 1.95.0 stable (released 2026-04-16).
+#
+# Rationale: the kernel doesn't use any nightly-only features
+# (no #![feature(...)], no -Zbuild-std). Nightly was a holdover
+# from early Phase A. Pinning to stable gives contributors a
+# reproducible build without chasing rustc regressions.
+#
+# Caveat: `--features debug-kernel` currently hits a rustc ICE in
+# lint_mod/check_mod_deathness that is present in both 1.95 stable
+# and recent nightlies. Fixing that isn't blocked by the pin; the
+# regular build paths (default, qemu, vf2, net, rust-user, wasm-test)
+# all build cleanly on 1.95.
+channel = "1.95.0"
 targets = ["riscv64gc-unknown-none-elf"]
 components = ["rust-src", "rustfmt", "clippy", "llvm-tools"]
