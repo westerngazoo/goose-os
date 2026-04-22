@@ -357,6 +357,80 @@ pub mod net {
     pub fn close(handle: usize) -> Result<(), ()> {
         ncall(NET_CLOSE, handle, 0, 0).map(|_| ())
     }
+
+    /// Create a new TCP socket. Returns an opaque socket handle (0..MAX_TCP).
+    pub fn socket_tcp() -> Result<usize, ()> {
+        ncall(NET_SOCKET_TCP, 0, 0, 0)
+    }
+
+    /// Listen on a TCP socket at the given port.
+    pub fn listen(handle: usize, port: u16) -> Result<(), ()> {
+        ncall(NET_LISTEN, handle, port as usize, 0).map(|_| ())
+    }
+
+    /// Pack an IPv4 dotted-quad into a single usize the kernel unpacks.
+    #[inline(always)]
+    fn pack_ip(ip: [u8; 4]) -> usize {
+        ((ip[0] as usize) << 24)
+            | ((ip[1] as usize) << 16)
+            | ((ip[2] as usize) << 8)
+            | (ip[3] as usize)
+    }
+
+    /// Connect a TCP socket to a remote endpoint.
+    pub fn connect(handle: usize, ip: [u8; 4], port: u16) -> Result<(), ()> {
+        // Protocol: a2=handle, a3=packed_ip, a4=port (handled by handle_connect).
+        let packed = pack_ip(ip);
+        ncall(NET_CONNECT, handle, packed, port as usize).map(|_| ())
+    }
+
+    /// Extended 6-arg call — needed for UDP send_to (needs dest IP + port).
+    #[inline(always)]
+    fn ncall6(
+        opcode: usize,
+        a1: usize, a2: usize, a3: usize, a4: usize, a5: usize,
+    ) -> Result<usize, ()> {
+        let ret: usize;
+        unsafe {
+            asm!(
+                "ecall",
+                in("a7") SYS_CALL,
+                inlateout("a0") NET_PID => ret,
+                in("a1") opcode,
+                in("a2") a1,
+                in("a3") a2,
+                in("a4") a3,
+                in("a5") a4,
+                in("a6") a5,
+                options(nostack),
+            );
+        }
+        if ret == ERR { Err(()) } else { Ok(ret) }
+    }
+
+    /// Send a UDP datagram to (ip, port) from a bound UDP socket.
+    /// Returns the number of bytes the stack accepted.
+    pub fn send_udp_to(
+        handle: usize,
+        ip: [u8; 4],
+        port: u16,
+        data: &[u8],
+    ) -> Result<usize, ()> {
+        let packed = pack_ip(ip);
+        // a2=handle, a3=buf_va, a4=len, a5=packed_ip, a6=port
+        ncall6(NET_SEND, handle, data.as_ptr() as usize, data.len(), packed, port as usize)
+    }
+
+    /// Send on a connected TCP socket. Returns bytes written.
+    pub fn send(handle: usize, data: &[u8]) -> Result<usize, ()> {
+        // a5/a6 are zero for TCP.
+        ncall6(NET_SEND, handle, data.as_ptr() as usize, data.len(), 0, 0)
+    }
+
+    /// Non-blocking receive. Returns bytes read (0 if nothing pending).
+    pub fn recv(handle: usize, buf: &mut [u8]) -> Result<usize, ()> {
+        ncall(NET_RECV, handle, buf.as_mut_ptr() as usize, buf.len())
+    }
 }
 
 // ── Console Output (println! via SYS_PUTCHAR) ────────────────

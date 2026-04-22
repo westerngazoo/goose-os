@@ -162,10 +162,11 @@ mod kernel {
                         // Initialize smoltcp
                         crate::net::init();
                         println!("  [net] Network stack initialized (10.0.2.15/24, gw 10.0.2.2)");
-
-                        // Kernel smoke test: send a UDP packet to the gateway.
-                        // Proves smoltcp -> VirtIO TX round-trip works.
-                        crate::net::smoke_test();
+                        // Note: `net::smoke_test()` is disabled — sending a
+                        // boot-time UDP to 10.0.2.2 poisons the ARP cache
+                        // before userspace gets a chance, and slirp doesn't
+                        // reliably ARP-reply for the gateway itself. The
+                        // userspace net-test now drives the TX/RX path.
                     }
                     Err(e) => println!("  [virtio] Init failed: {:?}", e),
                 }

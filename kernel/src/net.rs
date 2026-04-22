@@ -299,11 +299,13 @@ pub fn handle_request(frame: &mut TrapFrame) {
             frame.a0 = handle_listen(arg1, arg2);
         }
         NET_SEND => {
-            // arg1 = socket handle, arg2 = buffer VA, arg3 = length
-            frame.a0 = handle_send(frame, arg1, arg2, frame.a4);
+            // a2 = socket handle, a3 = buffer VA, a4 = length
+            // For UDP: a5 = packed IPv4 destination, a6 = dest port
+            // For TCP: a5/a6 are ignored (socket must be connected).
+            frame.a0 = handle_send(frame, arg1, arg2, frame.a4, frame.a5, frame.a6);
         }
         NET_RECV => {
-            // arg1 = socket handle, arg2 = buffer VA, arg3 = max length
+            // a2 = socket handle, a3 = buffer VA, a4 = max length
             frame.a0 = handle_recv(frame, arg1, arg2, frame.a4);
         }
         NET_CLOSE => {
@@ -455,17 +457,49 @@ fn handle_listen(handle_idx: usize, port: usize) -> usize {
     }
 }
 
-fn handle_send(_frame: &TrapFrame, handle_idx: usize, buf_va: usize, len: usize) -> usize {
-    // For now, we read from user buffer via page table translation.
-    // This is a simplified version — full implementation needs proper
-    // user-to-kernel buffer copy using the process's page table.
-    unsafe {
+// Kernel staging buffer for user-buffer send/recv copies.
+// Sized to one page (4KB) — matches the single-page limit in
+// kvm::copy_{from,to}_user. Callers must chunk larger transfers.
+const STAGING_SIZE: usize = 4096;
+static mut STAGING: [u8; STAGING_SIZE] = [0; STAGING_SIZE];
+
+/// Monotonic timestamp in milliseconds for smoltcp.
+/// Derived from the kernel's 10ms preemption tick.
+#[inline]
+fn now_ms() -> i64 {
+    (crate::trap::ticks() as i64) * 10
+}
+
+fn handle_send(
+    _frame: &TrapFrame,
+    handle_idx: usize,
+    buf_va: usize,
+    len: usize,
+    packed_ip: usize,
+    port: usize,
+) -> usize {
+    if len == 0 || len > STAGING_SIZE {
+        return usize::MAX;
+    }
+    let satp = crate::process::current_satp();
+    if satp == 0 {
+        return usize::MAX;
+    }
+
+    // Copy user payload into kernel staging buffer.
+    let staging = unsafe { &mut STAGING[..len] };
+    if crate::kvm::copy_from_user(satp, buf_va, staging).is_err() {
+        return usize::MAX;
+    }
+
+    let sent = unsafe {
         let sockets = match NET_SOCKETS.as_mut() {
             Some(s) => s,
             None => return usize::MAX,
         };
 
         if handle_idx < MAX_TCP_SOCKETS {
+            // TCP send — socket must already be connected.
             let handle = match TCP_HANDLES[handle_idx] {
                 Some(h) => h,
                 None => return usize::MAX,
@@ -474,20 +508,64 @@ fn handle_send(_frame: &TrapFrame, handle_idx: usize, buf_va: usize, len: usize)
             if !socket.may_send() {
                 return usize::MAX;
             }
-            // TODO: Translate buf_va through process page table to get PA
-            // For now, return 0 (success stub)
-            let _ = buf_va;
-            let _ = len;
-            0
+            match socket.send_slice(staging) {
+                Ok(n) => n,
+                Err(_) => return usize::MAX,
+            }
         } else {
-            // UDP send
-            usize::MAX // TODO
+            // UDP send_to — destination comes from a5/a6.
+            let udp_idx = handle_idx - MAX_TCP_SOCKETS;
+            if udp_idx >= MAX_UDP_SOCKETS {
+                return usize::MAX;
+            }
+            let handle = match UDP_HANDLES[udp_idx] {
+                Some(h) => h,
+                None => return usize::MAX,
+            };
+            let socket = sockets.get_mut::<udp::Socket>(handle);
+            let ip = Ipv4Address::new(
+                ((packed_ip >> 24) & 0xFF) as u8,
+                ((packed_ip >> 16) & 0xFF) as u8,
+                ((packed_ip >> 8)  & 0xFF) as u8,
+                ( packed_ip        & 0xFF) as u8,
+            );
+            let endpoint = smoltcp::wire::IpEndpoint {
+                addr: IpAddress::Ipv4(ip),
+                port: port as u16,
+            };
+            match socket.send_slice(staging, endpoint) {
+                Ok(()) => len,
+                Err(_) => return usize::MAX,
+            }
         }
-    }
+    };
+
+    // Drive the stack so the packet actually leaves. Use a real monotonic
+    // timestamp so smoltcp's ARP + retransmit logic advances correctly.
+    poll(now_ms());
+
+    sent
 }
 
-fn handle_recv(_frame: &TrapFrame, handle_idx: usize, buf_va: usize, max_len: usize) -> usize {
-    unsafe {
+fn handle_recv(
+    _frame: &TrapFrame,
+    handle_idx: usize,
+    buf_va: usize,
+    max_len: usize,
+) -> usize {
+    if max_len == 0 || max_len > STAGING_SIZE {
+        return usize::MAX;
+    }
+    let satp = crate::process::current_satp();
+    if satp == 0 {
+        return usize::MAX;
+    }
+
+    // First poll so any newly-arrived RX packet is processed into the socket.
+    poll(now_ms());
+
+    let staging = unsafe { &mut STAGING[..max_len] };
+    let copied = unsafe {
         let sockets = match NET_SOCKETS.as_mut() {
             Some(s) => s,
             None => return usize::MAX,
@@ -500,16 +578,40 @@ fn handle_recv(_frame: &TrapFrame, handle_idx: usize, buf_va: usize, max_len: us
             };
             let socket = sockets.get_mut::<tcp::Socket>(handle);
             if !socket.may_recv() {
+                // Not connected yet — return 0 (would-block), not error.
+                return 0;
+            }
+            match socket.recv_slice(staging) {
+                Ok(n) => n,
+                Err(_) => return usize::MAX,
+            }
+        } else {
+            let udp_idx = handle_idx - MAX_TCP_SOCKETS;
+            if udp_idx >= MAX_UDP_SOCKETS {
                 return usize::MAX;
             }
-            // TODO: Translate buf_va, copy data to user buffer
-            let _ = buf_va;
-            let _ = max_len;
-            0
-        } else {
-            usize::MAX // TODO
+            let handle = match UDP_HANDLES[udp_idx] {
+                Some(h) => h,
+                None => return usize::MAX,
+            };
+            let socket = sockets.get_mut::<udp::Socket>(handle);
+            match socket.recv_slice(staging) {
+                Ok((n, _endpoint)) => n,
+                Err(smoltcp::socket::udp::RecvError::Exhausted) => 0,
+                Err(_) => return usize::MAX,
+            }
         }
+    };
+
+    if copied == 0 {
+        return 0;
     }
+
+    // Copy back to user.
+    if crate::kvm::copy_to_user(satp, buf_va, &unsafe { &STAGING[..] }[..copied]).is_err() {
+        return usize::MAX;
+    }
+    copied
 }
 
 fn handle_close(handle_idx: usize) -> usize {

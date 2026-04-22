@@ -94,6 +94,12 @@ impl TrapFrame {
 /// Tick counter — incremented on each timer interrupt.
 static mut TICKS: u64 = 0;
 
+/// Monotonic tick counter. Increments every 10ms (the timer preemption tick).
+/// Exposed so subsystems (notably smoltcp) can compute monotonic timestamps.
+pub fn ticks() -> u64 {
+    unsafe { TICKS }
+}
+
 /// Initialize the trap vector.
 /// Writes our _trap_vector address into stvec (direct mode).
 /// Does NOT enable interrupts yet — call interrupts_enable() after

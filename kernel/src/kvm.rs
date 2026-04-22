@@ -304,6 +304,91 @@ pub fn satp_to_root(satp: u64) -> usize {
     ((satp & 0x0000_0FFF_FFFF_FFFF) << 12) as usize
 }
 
+// ── User-Buffer Access (Phase B) ────────────────────────────────
+//
+// Helpers for the kernel to read/write user-space memory. Uses the
+// pure Sv39 walker in page_table.rs; the unsafe pointer deref happens
+// here, localized behind a narrow API.
+
+/// Upper bound for valid user-space virtual addresses.
+/// Anything at or above this is kernel territory (identity-mapped RAM,
+/// MMIO, etc.) and must never be accessed through a user VA.
+const USER_VA_MAX: usize = 0x8000_0000;
+
+/// Translate a user-space VA in `satp`'s address space to a kernel-
+/// addressable physical address.
+///
+/// Returns `None` if:
+///   - `va` is >= USER_VA_MAX (kernel space),
+///   - the page isn't mapped,
+///   - the leaf PTE doesn't have the U bit set.
+pub fn translate_user(satp: u64, va: usize) -> Option<usize> {
+    if va >= USER_VA_MAX {
+        return None;
+    }
+    let root = satp_to_root(satp);
+    let result = crate::page_table::walk(root, va, |pa| unsafe {
+        core::ptr::read_volatile(pa as *const u64)
+    })?;
+    if !result.flags.contains(PteFlags::USER) {
+        return None;
+    }
+    Some(result.phys)
+}
+
+/// True if `[start, start+len)` stays within a single 4KB page.
+#[inline]
+fn fits_in_one_page(start: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    // -1 so we test inclusive end against the page boundary.
+    (start & !0xFFF) == ((start + len - 1) & !0xFFF)
+}
+
+/// Copy `dst.len()` bytes from a user VA into a kernel slice.
+///
+/// Fails if the user range spans a page boundary (Phase B v1 — caller
+/// must chunk), the VA resolution fails, or the page isn't readable.
+pub fn copy_from_user(satp: u64, user_va: usize, dst: &mut [u8]) -> Result<(), ()> {
+    if !fits_in_one_page(user_va, dst.len()) {
+        return Err(());
+    }
+    let phys = translate_user(satp, user_va).ok_or(())?;
+    unsafe {
+        core::ptr::copy_nonoverlapping(phys as *const u8, dst.as_mut_ptr(), dst.len());
+    }
+    Ok(())
+}
+
+/// Copy a kernel slice into user memory at `user_va`.
+///
+/// Fails if the user range spans a page boundary, the VA resolution
+/// fails, or the page isn't writable.
+pub fn copy_to_user(satp: u64, user_va: usize, src: &[u8]) -> Result<(), ()> {
+    if !fits_in_one_page(user_va, src.len()) {
+        return Err(());
+    }
+    // Re-walk so we can check the W bit on the leaf.
+    if user_va >= USER_VA_MAX {
+        return Err(());
+    }
+    let root = satp_to_root(satp);
+    let result = crate::page_table::walk(root, user_va, |pa| unsafe {
+        core::ptr::read_volatile(pa as *const u64)
+    }).ok_or(())?;
+    if !result.flags.contains(PteFlags::USER) {
+        return Err(());
+    }
+    if !result.flags.contains(PteFlags::WRITE) {
+        return Err(());
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), result.phys as *mut u8, src.len());
+    }
+    Ok(())
+}
+
 // ── Linker symbol accessors ─────────────────────────────────────
 
 /// Read a linker symbol as a usize address.

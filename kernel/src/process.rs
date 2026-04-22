@@ -84,6 +84,15 @@ pub fn current_pid() -> usize {
     unsafe { CURRENT_PID }
 }
 
+/// Get the satp value of the currently running process.
+/// Returns 0 if CURRENT_PID is 0 (kernel context).
+pub fn current_satp() -> u64 {
+    unsafe {
+        let pid = CURRENT_PID;
+        if pid == 0 { 0 } else { PROCS[pid].satp }
+    }
+}
+
 /// Dump all non-Free process slots. Called by kdump_procs! macro.
 ///
 /// Always compiled (body is empty without `debug-kernel` feature).

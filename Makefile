@@ -179,7 +179,7 @@ test-net-user: build-user-net
 	cd kernel && GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features "qemu rust-user net" --no-default-features
 	@echo $(NEXT_BUILD) > $(BUILD_FILE)
 	@echo "=== Rust Userspace Net Test ==="
-	timeout 6 $(QEMU) $(QEMU_ARGS) $(NET_ARGS) \
+	timeout 10 $(QEMU) $(QEMU_ARGS) $(NET_ARGS) \
 	  -object filter-dump,id=f1,netdev=net0,file=build/goose-net.pcap \
 	  -kernel $(KERNEL_ELF) || true
 

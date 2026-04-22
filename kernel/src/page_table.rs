@@ -248,6 +248,60 @@ pub const fn make_satp(root_table_phys: usize, asid: u16) -> u64 {
     (SATP_SV39 << 60) | ((asid as u64) << 44) | ppn
 }
 
+// ── Page Walk (pure) ────────────────────────────────────────────
+
+/// Result of a successful Sv39 page walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkResult {
+    /// Final resolved physical address (with page offset applied).
+    pub phys: usize,
+    /// Flags of the leaf PTE (tells you R/W/X/U).
+    pub flags: PteFlags,
+}
+
+/// Walk an Sv39 page table from `root` (physical) to resolve `va`.
+///
+/// Pure: takes a `read` closure that returns the u64 PTE at a given
+/// physical address. The caller is responsible for turning that PA
+/// into an actual memory read (under identity mapping it's just a
+/// pointer dereference).
+///
+/// Returns `None` if:
+///   - any PTE along the walk is invalid
+///   - a leaf at a higher level has non-zero lower-VPN bits (misaligned
+///     superpage — rejected for simplicity; Phase A/B kernel only
+///     emits 4K leaves)
+///   - the final level-0 PTE is a branch (malformed table)
+///
+/// Returns `Some(WalkResult { phys, flags })` otherwise.
+pub fn walk<F: FnMut(usize) -> u64>(root: usize, va: usize, mut read: F) -> Option<WalkResult> {
+    let (vpn2, vpn1, vpn0, offset) = va_parts(va);
+    let indices = [vpn2, vpn1, vpn0];
+    let mut table = root;
+    for (level_from_top, &idx) in indices.iter().enumerate() {
+        let pte_pa = table + idx * 8;
+        let pte = Pte::new_from_bits(read(pte_pa));
+        if !pte.is_valid() {
+            return None;
+        }
+        if pte.is_leaf() {
+            // Phase B v1 only supports 4K leaves (no 1G/2M superpages).
+            // Reject superpages defensively.
+            if level_from_top != 2 {
+                return None;
+            }
+            return Some(WalkResult {
+                phys: pte.phys_addr() + offset,
+                flags: pte.flags(),
+            });
+        }
+        // Branch: descend.
+        table = pte.phys_addr();
+    }
+    // Ran out of levels without finding a leaf — malformed.
+    None
+}
+
 // ── Host-side unit tests ────────────────────────────────────────
 
 #[cfg(test)]
