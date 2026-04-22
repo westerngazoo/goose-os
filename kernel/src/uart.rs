@@ -42,6 +42,7 @@ impl Uart {
 
     /// Initialize UART: 8-bit words, FIFOs enabled, interrupt output on.
     pub fn init(&self) {
+        // SAFETY: INV-3 — UART MMIO base is fixed by the platform spec.
         unsafe {
             // IER: disable all interrupts during setup
             ptr::write_volatile(self.reg(1), 0x00);
@@ -57,6 +58,7 @@ impl Uart {
 
     /// Write a single byte, waiting until the transmitter is ready.
     pub fn putc(&self, c: u8) {
+        // SAFETY: INV-3 — UART registers. Volatile, no aliasing concerns.
         unsafe {
             // Spin until LSR bit 5 (THR empty) is set
             while ptr::read_volatile(self.reg(5)) & (1 << 5) == 0 {}
@@ -78,6 +80,7 @@ impl Uart {
     /// Enable receive-data-available interrupts.
     /// Call this AFTER PLIC is configured, BEFORE interrupts_enable().
     pub fn enable_rx_interrupt(&self) {
+        // SAFETY: INV-3 — UART IER register.
         unsafe {
             // IER bit 0 (ERBFI): interrupt when RX data is available
             // Keep bit 1 (ETBEI) clear — TX stays polling
@@ -88,6 +91,7 @@ impl Uart {
     /// Disable receive-data-available interrupts.
     /// Used when switching to polling mode (e.g., kernel idle loop).
     pub fn disable_rx_interrupt(&self) {
+        // SAFETY: INV-3 — UART IER register.
         unsafe {
             ptr::write_volatile(self.reg(1), 0x00);
         }
@@ -95,6 +99,7 @@ impl Uart {
 
     /// Non-blocking read. Returns Some(byte) if data is available.
     pub fn getc(&self) -> Option<u8> {
+        // SAFETY: INV-3 — UART LSR and RBR are MMIO registers.
         unsafe {
             // LSR bit 0 (DR): data ready
             if ptr::read_volatile(self.reg(5)) & 1 != 0 {

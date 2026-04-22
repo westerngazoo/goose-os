@@ -103,7 +103,11 @@ pub fn parse(data: &[u8]) -> Result<ElfInfo, ElfError> {
         return Err(ElfError::TooSmall);
     }
 
-    // Safety: data is long enough, Elf64Header is 64 bytes, repr(C).
+    // SAFETY: INV-9 — bounds checked (data.len() >= 64 on the line above).
+    // NOTE: alignment assumption. include_bytes! gives alignment 1 but
+    // Elf64Header is repr(C) with effective alignment 8. LLVM currently emits
+    // the byte-wise loads we want, but this is a latent issue tracked in
+    // docs/unsafe-audit.md follow-up #1 (elf.rs alignment).
     let hdr = unsafe { &*(data.as_ptr() as *const Elf64Header) };
 
     // Validate magic
@@ -143,6 +147,9 @@ pub fn parse(data: &[u8]) -> Result<ElfInfo, ElfError> {
             return Err(ElfError::SegmentOutOfBounds);
         }
 
+        // SAFETY: INV-9 — bounds checked on the line above
+        // (offset + 56 <= data.len(), and sizeof(Elf64Phdr) == 56).
+        // Alignment caveat: see docs/unsafe-audit.md follow-up #1.
         let phdr = unsafe { &*(data.as_ptr().add(offset) as *const Elf64Phdr) };
 
         if phdr.p_type != PT_LOAD {

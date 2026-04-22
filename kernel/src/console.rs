@@ -48,6 +48,7 @@ macro_rules! kdump_csrs {
             let sepc: usize;
             let scause: usize;
             let stval: usize;
+            // SAFETY: INV-7 — reading S-mode CSRs from S-mode (kernel).
             unsafe {
                 core::arch::asm!("csrr {}, sstatus", out(reg) sstatus);
                 core::arch::asm!("csrr {}, sie", out(reg) sie);

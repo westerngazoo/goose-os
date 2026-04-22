@@ -24,6 +24,7 @@ const CLAIM_COMPLETE: usize = THRESHOLD + 4;
 /// IRQs are enabled individually when a process calls SYS_IRQ_REGISTER.
 /// This prevents IRQ floods before a userspace server owns the interrupt.
 pub fn init() {
+    // SAFETY: INV-3 — PLIC MMIO base is fixed by platform spec. Boot-time init.
     unsafe {
         // Set UART0 priority = 1 (above threshold → eligible for delivery)
         ptr::write_volatile(priority_addr(UART0_IRQ) as *mut u32, 1);
@@ -49,6 +50,8 @@ pub fn init() {
 ///
 /// Called from SYS_IRQ_REGISTER when a process claims an IRQ.
 pub fn enable_irq(irq: u32) {
+    // SAFETY: INV-3 — PLIC enable-bit MMIO. Read-modify-write is safe under
+    // INV-1 (single-hart); no concurrent enable_irq can race the RMW.
     unsafe {
         let word_index = (irq / 32) as usize;
         let bit_index = irq % 32;
@@ -62,16 +65,19 @@ pub fn enable_irq(irq: u32) {
 
 /// Claim the highest-priority pending interrupt.
 pub fn claim() -> u32 {
+    // SAFETY: INV-3 — CLAIM_COMPLETE is the PLIC claim register.
     unsafe { ptr::read_volatile(CLAIM_COMPLETE as *const u32) }
 }
 
 /// Signal that we're done handling an interrupt.
 pub fn complete(irq: u32) {
+    // SAFETY: INV-3 — writing to PLIC complete register.
     unsafe { ptr::write_volatile(CLAIM_COMPLETE as *mut u32, irq); }
 }
 
 /// Dump PLIC state for debugging.
 pub fn dump() {
+    // SAFETY: INV-3 — all reads are PLIC MMIO, no side effects.
     unsafe {
         let pri = ptr::read_volatile(priority_addr(UART0_IRQ) as *const u32);
         let word_index = (UART0_IRQ / 32) as usize;
