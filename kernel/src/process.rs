@@ -14,6 +14,9 @@ use crate::{println, kdebug, kdump_csrs, kdump_plic, kdump_procs};
 
 use crate::security::{self, MAX_PROCS, MAX_IRQS};
 
+// Re-export so other modules (e.g., net.rs) can iterate the process table.
+pub(crate) use crate::security::MAX_PROCS as MAX_PROCS_PUB;
+
 // ── Process State Machine ──────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -25,6 +28,19 @@ pub enum ProcessState {
     BlockedRecv,    // Waiting for sender to call SEND
     BlockedCall,    // Sent via SYS_CALL, waiting for SYS_REPLY
     BlockedWait,    // Waiting for child process to exit (SYS_WAIT)
+    BlockedNet,     // Waiting for a network event (recv data, TCP connect) — Phase B.next
+}
+
+/// What network event a BlockedNet process is waiting on.
+///
+/// Stored in Process.net_op while state == BlockedNet. `net.rs::wake_blocked`
+/// iterates all BlockedNet processes after each poll and tries to complete
+/// the matching op.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetOp {
+    None,
+    Recv,    // completed when socket has at least one byte
+    Connect, // completed when TCP socket reaches Established (or Closed = failed)
 }
 
 // ── Process Control Block ──────────────────────────────────────
@@ -46,6 +62,11 @@ pub struct Process {
     // IRQ ownership (Phase 13)
     pub irq_num: u32,           // Registered IRQ number (0 = none)
     pub irq_pending: bool,      // IRQ fired while not in BlockedRecv
+    // Network blocking state (Phase B.next) — valid when state == BlockedNet
+    pub net_op: NetOp,          // NetOp::None when not blocked on a net event
+    pub net_socket: usize,      // Socket handle index (TCP 0..MAX_TCP, UDP offset by MAX_TCP)
+    pub net_buf_va: usize,      // User VA for recv buffer (recv only)
+    pub net_buf_len: usize,     // Max bytes to copy (recv only)
 }
 
 impl Process {
@@ -63,6 +84,10 @@ impl Process {
             exit_code: 0,
             irq_num: 0,
             irq_pending: false,
+            net_op: NetOp::None,
+            net_socket: 0,
+            net_buf_va: 0,
+            net_buf_len: 0,
         }
     }
 }
@@ -842,6 +867,10 @@ fn create_process(
             exit_code: 0,
             irq_num: 0,
             irq_pending: false,
+            net_op: NetOp::None,
+            net_socket: 0,
+            net_buf_va: 0,
+            net_buf_len: 0,
         };
     }
 
@@ -928,6 +957,10 @@ fn create_process_from_elf(
             exit_code: 0,
             irq_num: 0,
             irq_pending: false,
+            net_op: NetOp::None,
+            net_socket: 0,
+            net_buf_va: 0,
+            net_buf_len: 0,
         };
     }
 

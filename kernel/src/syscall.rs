@@ -394,6 +394,10 @@ pub fn sys_spawn(frame: &mut TrapFrame) {
             exit_code: 0,
             irq_num: 0,
             irq_pending: false,
+            net_op: crate::process::NetOp::None,
+            net_socket: 0,
+            net_buf_va: 0,
+            net_buf_len: 0,
         };
     }
 

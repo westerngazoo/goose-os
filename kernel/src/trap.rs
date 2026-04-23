@@ -416,6 +416,8 @@ fn handle_external(frame: &mut TrapFrame) {
                 let ticks = unsafe { TICKS };
                 let timestamp_ms = (ticks * 10) as i64;
                 crate::net::poll(timestamp_ms);
+                // Wake any processes blocked on sockets that now have data.
+                crate::net::wake_blocked();
                 plic::complete(irq);
                 return;
             }
@@ -450,6 +452,9 @@ fn handle_timer(frame: &mut TrapFrame) {
     if ticks % 10 == 0 && crate::virtio::is_ready() {
         let timestamp_ms = (ticks * 10) as i64;
         crate::net::poll(timestamp_ms);
+        // Wake any process blocked on NET_RECV / NET_CONNECT whose condition
+        // was satisfied by this poll (new RX packet, TCP handshake complete).
+        crate::net::wake_blocked();
     }
 
     // Preempt or schedule based on where we came from.
