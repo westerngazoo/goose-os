@@ -10,25 +10,14 @@
 
 use core::arch::{asm, global_asm};
 use crate::{plic, platform, println, kdebug, kdump_csrs};
-
-/// Syscall numbers — must match userspace programs.
-pub const SYS_PUTCHAR: usize = 0;
-pub const SYS_EXIT: usize = 1;
-pub const SYS_SEND: usize = 2;
-pub const SYS_RECEIVE: usize = 3;
-pub const SYS_CALL: usize = 4;
-pub const SYS_REPLY: usize = 5;
-pub const SYS_MAP: usize = 6;
-pub const SYS_UNMAP: usize = 7;
-pub const SYS_ALLOC_PAGES: usize = 8;
-pub const SYS_FREE_PAGES: usize = 9;
-pub const SYS_SPAWN: usize = 10;
-pub const SYS_WAIT: usize = 11;
-pub const SYS_GETPID: usize = 12;
-pub const SYS_YIELD: usize = 13;
-pub const SYS_IRQ_REGISTER: usize = 14;
-pub const SYS_IRQ_ACK: usize = 15;
-pub const SYS_REBOOT: usize = 16;
+// Syscall numbers and error codes are the ABI. They live in abi.rs,
+// not here — see docs for the "one source of truth" rule.
+use crate::abi::{
+    SYS_PUTCHAR, SYS_EXIT, SYS_SEND, SYS_RECEIVE, SYS_CALL, SYS_REPLY,
+    SYS_MAP, SYS_UNMAP, SYS_ALLOC_PAGES, SYS_FREE_PAGES, SYS_SPAWN,
+    SYS_WAIT, SYS_GETPID, SYS_YIELD, SYS_IRQ_REGISTER, SYS_IRQ_ACK,
+    SYS_REBOOT,
+};
 
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));

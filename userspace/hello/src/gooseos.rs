@@ -5,7 +5,10 @@
 
 use core::arch::asm;
 
-// ── Syscall Numbers (must match kernel trap.rs) ──────────────
+// ── Syscall Numbers (MUST MATCH kernel/src/abi.rs) ──────────────
+// The canonical definition lives in kernel/src/abi.rs. When a shared
+// `abi` crate is introduced via a Cargo workspace, these consts will
+// become `use abi::*`. Until then: manual mirror.
 
 const SYS_PUTCHAR: usize = 0;
 const SYS_EXIT: usize = 1;
