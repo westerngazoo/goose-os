@@ -1,0 +1,23 @@
+[package]
+name = "netsrv"
+version = "0.1.0"
+edition = "2021"
+
+# The userspace network server. Destination home for smoltcp after
+# Item 2 of the post-architecture-review migration.
+#
+# Today (Step 2a): skeleton — compiles, runs, loops on receive/reply,
+# stubs every opcode as ERR. Proves the crate integrates with the
+# GooseOS syscall ABI.
+#
+# Tomorrow (Step 2b+): smoltcp moves from kernel/src/net.rs into this
+# crate, the kernel's PID-3 intercept in trap.rs goes away, and PID 3
+# becomes a real process that owns the TCP/IP stack.
+
+[features]
+default = []
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

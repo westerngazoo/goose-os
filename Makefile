@@ -109,6 +109,14 @@ build-user:
 build-user-net:
 	cd userspace/hello && CARGO_ENCODED_RUSTFLAGS='-Clink-arg=-Tlinker.ld' cargo build --release --features net
 
+# Userspace network server (PID 3) — Step 2a skeleton.
+# Today: compiles standalone, not yet spawned by the kernel. The
+# kernel's trap.rs still intercepts PID 3. Migration continues in
+# Step 2b when netsrv grows real smoltcp logic and the intercept
+# is removed.
+build-netsrv:
+	cd userspace/netsrv && CARGO_ENCODED_RUSTFLAGS='-Clink-arg=-Tlinker.ld' cargo build --release
+
 run-rust-user: build-user
 	cd kernel && GOOSE_BUILD=$(NEXT_BUILD) cargo build --release --features "qemu rust-user" --no-default-features
 	@echo $(NEXT_BUILD) > $(BUILD_FILE)
