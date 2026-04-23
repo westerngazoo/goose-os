@@ -52,6 +52,16 @@ pub fn sys_map(frame: &mut TrapFrame) {
         return;
     }
 
+    // Defense-in-depth (Phase B.next): phys must be in the user-heap
+    // region, not kernel text/rodata/data/bss/stack or any MMIO. Without
+    // this, a malicious process could SYS_MAP a kernel-internal page
+    // (e.g., another process's page-table root) into its own address
+    // space and read/write it through a U-mode PTE.
+    if !kvm::is_user_heap_pa(phys) {
+        frame.a0 = usize::MAX;
+        return;
+    }
+
     // Map flags: 0 = USER_RW, 1 = USER_RX
     if !security::is_valid_map_flags(flags_arg) {
         frame.a0 = usize::MAX;

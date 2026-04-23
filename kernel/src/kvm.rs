@@ -315,6 +315,21 @@ pub fn satp_to_root(satp: u64) -> usize {
 /// MMIO, etc.) and must never be accessed through a user VA.
 const USER_VA_MAX: usize = 0x8000_0000;
 
+/// Is `pa` a physical address inside the page-allocator's heap region?
+///
+/// The heap is `[_end, _heap_end)` — everything between the end of the
+/// kernel BSS and the top of the stack region. This is the only pool
+/// pages can be allocated from via SYS_ALLOC_PAGES, so any PA that's
+/// legitimately user-accessible must live here.
+///
+/// Rejects: kernel .text/.rodata/.data/.bss, kernel stack, MMIO
+/// (UART/PLIC/VirtIO), and any PA outside the 128MB RAM window.
+pub fn is_user_heap_pa(pa: usize) -> bool {
+    let heap_start = linker_symbol("_end");
+    let heap_end = linker_symbol("_heap_end");
+    pa >= heap_start && pa < heap_end
+}
+
 /// Translate a user-space VA in `satp`'s address space to a kernel-
 /// addressable physical address.
 ///
@@ -331,6 +346,13 @@ pub fn translate_user(satp: u64, va: usize) -> Option<usize> {
         core::ptr::read_volatile(pa as *const u64)
     })?;
     if !result.flags.contains(PteFlags::USER) {
+        return None;
+    }
+    // Defense-in-depth: the PA must land in the allocator's heap region.
+    // Rejects stale PTEs that somehow point at kernel image/MMIO/stack.
+    // `result.phys` includes the page offset — strip it for the check.
+    let page_pa = result.phys & !0xFFF;
+    if !is_user_heap_pa(page_pa) {
         return None;
     }
     Some(result.phys)
@@ -381,6 +403,11 @@ pub fn copy_to_user(satp: u64, user_va: usize, src: &[u8]) -> Result<(), ()> {
         return Err(());
     }
     if !result.flags.contains(PteFlags::WRITE) {
+        return Err(());
+    }
+    // Defense-in-depth: PA must be in the allocator's heap region.
+    let page_pa = result.phys & !0xFFF;
+    if !is_user_heap_pa(page_pa) {
         return Err(());
     }
     unsafe {
