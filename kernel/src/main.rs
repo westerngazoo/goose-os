@@ -23,6 +23,8 @@ mod trap;
 mod uart;
 
 mod abi;
+#[cfg(not(test))]
+mod handlers;
 mod page_alloc;
 #[allow(dead_code)]
 mod page_table;

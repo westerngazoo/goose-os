@@ -10,14 +10,8 @@
 
 use core::arch::{asm, global_asm};
 use crate::{plic, platform, println, kdebug, kdump_csrs};
-// Syscall numbers and error codes are the ABI. They live in abi.rs,
-// not here — see docs for the "one source of truth" rule.
-use crate::abi::{
-    SYS_PUTCHAR, SYS_EXIT, SYS_SEND, SYS_RECEIVE, SYS_CALL, SYS_REPLY,
-    SYS_MAP, SYS_UNMAP, SYS_ALLOC_PAGES, SYS_FREE_PAGES, SYS_SPAWN,
-    SYS_WAIT, SYS_GETPID, SYS_YIELD, SYS_IRQ_REGISTER, SYS_IRQ_ACK,
-    SYS_REBOOT,
-};
+use crate::abi::SYS_MAX;
+use crate::{handlers, ipc, process, syscall};
 
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));
@@ -215,91 +209,45 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
 ///   a0 = first argument (and return value)
 ///   sepc is advanced by 4 so sret goes to the instruction after ecall.
 fn handle_ecall(frame: &mut TrapFrame) {
-    let syscall_num = frame.a7;
+    // Dispatch table: one function pointer per syscall number.
+    //
+    // Ordered by SYS_* value from abi.rs. The index MUST be kept in
+    // sync with abi.rs — adding a syscall means appending one entry
+    // here and bumping SYS_MAX in abi.rs. A debug_assert at table
+    // construction time would be ideal; until const_fn grows the
+    // right primitives, the invariant is enforced by code review +
+    // the SYS_MAX bounds check on dispatch.
+    //
+    // All handlers have the same signature: fn(&mut TrapFrame).
+    // Handlers are responsible for advancing sepc themselves (most
+    // do `frame.sepc += 4` at the top; exit/send/receive/call/reply
+    // handle sepc as part of their blocking/scheduling logic).
+    type Handler = fn(&mut TrapFrame);
+    static HANDLERS: [Handler; SYS_MAX + 1] = [
+        handlers::sys_putchar,      // 0  SYS_PUTCHAR
+        process::sys_exit,          // 1  SYS_EXIT
+        ipc::sys_send,              // 2  SYS_SEND
+        ipc::sys_receive,           // 3  SYS_RECEIVE
+        handlers::sys_call,         // 4  SYS_CALL (with net intercept)
+        ipc::sys_reply,             // 5  SYS_REPLY
+        syscall::sys_map,           // 6  SYS_MAP
+        syscall::sys_unmap,         // 7  SYS_UNMAP
+        syscall::sys_alloc_pages,   // 8  SYS_ALLOC_PAGES
+        syscall::sys_free_pages,    // 9  SYS_FREE_PAGES
+        syscall::sys_spawn,         // 10 SYS_SPAWN
+        process::sys_wait,          // 11 SYS_WAIT
+        process::sys_getpid,        // 12 SYS_GETPID
+        process::sys_yield,         // 13 SYS_YIELD
+        syscall::sys_irq_register,  // 14 SYS_IRQ_REGISTER
+        syscall::sys_irq_ack,       // 15 SYS_IRQ_ACK
+        handlers::sys_reboot,       // 16 SYS_REBOOT
+    ];
 
-    match syscall_num {
-        SYS_PUTCHAR => {
-            let ch = frame.a0 as u8;
-            crate::uart::Uart::platform().putc(ch);
-            frame.a0 = 0;
-            frame.sepc += 4;
-        }
-        SYS_EXIT => {
-            crate::process::sys_exit(frame);
-            // sys_exit handles sepc — don't advance
-            return;
-        }
-        SYS_SEND => {
-            crate::ipc::sys_send(frame);
-            return;
-        }
-        SYS_RECEIVE => {
-            crate::ipc::sys_receive(frame);
-            return;
-        }
-        SYS_CALL => {
-            // Phase B: Intercept calls to the network server PID
-            #[cfg(feature = "net")]
-            if frame.a0 == crate::net::NET_SERVER_PID {
-                crate::net::handle_request(frame);
-                return;
-            }
-            crate::ipc::sys_call(frame);
-            return;
-        }
-        SYS_REPLY => {
-            crate::ipc::sys_reply(frame);
-            return;
-        }
-        SYS_MAP => {
-            crate::syscall::sys_map(frame);
-            return;
-        }
-        SYS_UNMAP => {
-            crate::syscall::sys_unmap(frame);
-            return;
-        }
-        SYS_ALLOC_PAGES => {
-            crate::syscall::sys_alloc_pages(frame);
-            return;
-        }
-        SYS_FREE_PAGES => {
-            crate::syscall::sys_free_pages(frame);
-            return;
-        }
-        SYS_SPAWN => {
-            crate::syscall::sys_spawn(frame);
-            return;
-        }
-        SYS_WAIT => {
-            crate::process::sys_wait(frame);
-            return;
-        }
-        SYS_GETPID => {
-            crate::process::sys_getpid(frame);
-            return;
-        }
-        SYS_YIELD => {
-            crate::process::sys_yield(frame);
-            return;
-        }
-        SYS_IRQ_REGISTER => {
-            crate::syscall::sys_irq_register(frame);
-            return;
-        }
-        SYS_IRQ_ACK => {
-            crate::syscall::sys_irq_ack(frame);
-            return;
-        }
-        SYS_REBOOT => {
-            println!("\n  [kernel] SYS_REBOOT — rebooting...");
-            crate::kernel::sbi_system_reset();
-        }
-        _ => {
-            println!("\n  [kernel] Unknown syscall: {} (a0={:#x})", syscall_num, frame.a0);
-            frame.a0 = usize::MAX;
-            frame.sepc += 4;
-        }
+    let syscall_num = frame.a7;
+    if syscall_num <= SYS_MAX {
+        HANDLERS[syscall_num](frame);
+    } else {
+        handlers::sys_unknown(frame);
     }
 }
 
