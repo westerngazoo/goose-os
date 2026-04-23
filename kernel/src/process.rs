@@ -166,6 +166,14 @@ pub fn kill_current(frame: &mut TrapFrame, exit_code: usize) {
             PROCS[current].irq_num = 0;
         }
 
+        // Clean up pending network op (Phase B.next): prevents wake_blocked
+        // from ever acting on a dead process slot, and stops stale state
+        // leaking into whoever next reuses this PID.
+        PROCS[current].net_op = NetOp::None;
+        PROCS[current].net_socket = 0;
+        PROCS[current].net_buf_va = 0;
+        PROCS[current].net_buf_len = 0;
+
         // Wake any parent that's BlockedWait on us
         for i in 1..MAX_PROCS {
             if PROCS[i].state == ProcessState::BlockedWait
@@ -991,6 +999,12 @@ pub fn sys_exit(frame: &mut TrapFrame) {
             }
             PROCS[current].irq_num = 0;
         }
+
+        // Phase B.next: Clean up any pending network op. Mirrors kill_current.
+        PROCS[current].net_op = NetOp::None;
+        PROCS[current].net_socket = 0;
+        PROCS[current].net_buf_va = 0;
+        PROCS[current].net_buf_len = 0;
 
         // Wake any parent that's BlockedWait on us
         for i in 1..MAX_PROCS {
