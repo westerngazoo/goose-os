@@ -358,60 +358,74 @@ pub fn translate_user(satp: u64, va: usize) -> Option<usize> {
     Some(result.phys)
 }
 
-/// True if `[start, start+len)` stays within a single 4KB page.
+/// Bytes from `start` to the next 4KB page boundary (inclusive-exclusive).
+/// Returns `4096` if `start` is page-aligned.
 #[inline]
-fn fits_in_one_page(start: usize, len: usize) -> bool {
-    if len == 0 {
-        return true;
-    }
-    // -1 so we test inclusive end against the page boundary.
-    (start & !0xFFF) == ((start + len - 1) & !0xFFF)
+fn bytes_to_page_end(start: usize) -> usize {
+    4096 - (start & 0xFFF)
 }
 
 /// Copy `dst.len()` bytes from a user VA into a kernel slice.
 ///
-/// Fails if the user range spans a page boundary (Phase B v1 — caller
-/// must chunk), the VA resolution fails, or the page isn't readable.
+/// Walks page-by-page — handles buffers that straddle 4K boundaries.
+/// Every page along the way must be mapped, U-bit set, and resolve to
+/// the allocator's heap region. Any violation aborts with `Err(())`
+/// and leaves the kernel slice partially-written (caller must discard).
 pub fn copy_from_user(satp: u64, user_va: usize, dst: &mut [u8]) -> Result<(), ()> {
-    if !fits_in_one_page(user_va, dst.len()) {
-        return Err(());
-    }
-    let phys = translate_user(satp, user_va).ok_or(())?;
-    unsafe {
-        core::ptr::copy_nonoverlapping(phys as *const u8, dst.as_mut_ptr(), dst.len());
+    let total = dst.len();
+    let mut done = 0usize;
+    while done < total {
+        let va = user_va.wrapping_add(done);
+        let chunk = core::cmp::min(bytes_to_page_end(va), total - done);
+        let phys = translate_user(satp, va).ok_or(())?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                phys as *const u8,
+                dst.as_mut_ptr().add(done),
+                chunk,
+            );
+        }
+        done += chunk;
     }
     Ok(())
 }
 
 /// Copy a kernel slice into user memory at `user_va`.
 ///
-/// Fails if the user range spans a page boundary, the VA resolution
-/// fails, or the page isn't writable.
+/// Walks page-by-page. Each page must be mapped, U + W bits set, and
+/// resolve to the allocator's heap region. Partial failure can leave
+/// some pages partially written — caller must treat as corrupted.
 pub fn copy_to_user(satp: u64, user_va: usize, src: &[u8]) -> Result<(), ()> {
-    if !fits_in_one_page(user_va, src.len()) {
-        return Err(());
-    }
-    // Re-walk so we can check the W bit on the leaf.
-    if user_va >= USER_VA_MAX {
-        return Err(());
-    }
-    let root = satp_to_root(satp);
-    let result = crate::page_table::walk(root, user_va, |pa| unsafe {
-        core::ptr::read_volatile(pa as *const u64)
-    }).ok_or(())?;
-    if !result.flags.contains(PteFlags::USER) {
-        return Err(());
-    }
-    if !result.flags.contains(PteFlags::WRITE) {
-        return Err(());
-    }
-    // Defense-in-depth: PA must be in the allocator's heap region.
-    let page_pa = result.phys & !0xFFF;
-    if !is_user_heap_pa(page_pa) {
-        return Err(());
-    }
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), result.phys as *mut u8, src.len());
+    let total = src.len();
+    let mut done = 0usize;
+    while done < total {
+        let va = user_va.wrapping_add(done);
+        if va >= USER_VA_MAX {
+            return Err(());
+        }
+        let chunk = core::cmp::min(bytes_to_page_end(va), total - done);
+        let root = satp_to_root(satp);
+        let result = crate::page_table::walk(root, va, |pa| unsafe {
+            core::ptr::read_volatile(pa as *const u64)
+        }).ok_or(())?;
+        if !result.flags.contains(PteFlags::USER) {
+            return Err(());
+        }
+        if !result.flags.contains(PteFlags::WRITE) {
+            return Err(());
+        }
+        let page_pa = result.phys & !0xFFF;
+        if !is_user_heap_pa(page_pa) {
+            return Err(());
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(done),
+                result.phys as *mut u8,
+                chunk,
+            );
+        }
+        done += chunk;
     }
     Ok(())
 }
