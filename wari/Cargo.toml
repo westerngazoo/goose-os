@@ -1,0 +1,64 @@
+# Wari — workspace manifest.
+#
+# Members are split by compile target:
+#
+#   kernel/      → riscv64gc-unknown-none-elf  (Tier 0)
+#   drivers/*    → wasm32-unknown-unknown      (Tier 2, once populated)
+#   apps/*       → wasm32-unknown-unknown      (Tier 1)
+#   abi-shared/  → any target (pure no_std)
+#   wasi/        → any target (pure no_std + host test profile)
+#   tools/*      → host (x86_64/arm64)
+#   tests/*      → host (host-driven QEMU tests)
+#
+# Per-crate `.cargo/config.toml` selects the target. `cargo build` at
+# the workspace root respects each crate's default-target setting.
+#
+# Cargo.lock is committed — reproducible builds are mandatory (CLAUDE R8).
+
+[workspace]
+resolver = "2"
+members = [
+    "abi-shared",
+    "wasi",
+    "kernel",
+    "apps/hello",
+    # drivers/*  — populated in Phase 1
+    # tools/*    — populated as needed
+    # tests/*    — populated per-phase
+]
+exclude = [
+    "platform/vf2",  # firmware blobs only, not a crate
+    "build",         # output
+    "scripts",       # shell only
+    "docs",          # markdown only
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.95.0"
+license = "TBD"
+authors = ["Gustavo Delgadillo <goose@wari.dev>"]
+repository = "https://github.com/westerngazoo/goose-os"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_docs           = "warn"
+
+[workspace.lints.clippy]
+# Tier 0 rules — enforced workspace-wide. See CLAUDE.md R1–R8.
+undocumented_unsafe_blocks = "warn"
+unwrap_used                = "warn"
+expect_used                = "warn"
+panic                      = "warn"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+
+[profile.dev]
+panic = "abort"

@@ -1,0 +1,10 @@
+# Pinned stable — CLAUDE R8 (reproducible builds).
+# Bump only via explicit Gustavo-approved PR, never silently.
+
+[toolchain]
+channel = "1.95.0"
+components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
+targets = [
+    "riscv64gc-unknown-none-elf",
+    "wasm32-unknown-unknown",
+]

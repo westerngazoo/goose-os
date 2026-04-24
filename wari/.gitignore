@@ -1,0 +1,17 @@
+# Build artifacts
+**/target/
+/build/*
+!/build/.gitkeep
+
+# rustc crash dumps — R8 says reproducible builds, ICE dumps are not
+rustc-ice-*.txt
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# QEMU runtime debris
+*.pcap
+*.img.tmp

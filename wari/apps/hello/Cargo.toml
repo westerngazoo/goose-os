@@ -1,0 +1,26 @@
+[package]
+name = "wari-hello"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The Tier-1 WASM 'hello world' — Phase 0 exit demo."
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+wari-abi = { path = "../../abi-shared" }
+# wari-wasi bindings: once the wasmi integration lands, this app will
+# call WASI host functions through generated bindings. Phase 0b.
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+strip = true

@@ -1,0 +1,17 @@
+[package]
+name = "wari-abi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Wari user/kernel ABI — syscall numbers, opcodes, error codes. One source of truth."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Host-side tests — enables std for the test harness, kept off for
+# the kernel's no_std build.
+test-utils = []

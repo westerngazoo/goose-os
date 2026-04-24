@@ -1,0 +1,29 @@
+[package]
+name = "wari-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wari"
+path = "src/main.rs"
+
+[dependencies]
+wari-abi = { path = "../abi-shared" }
+# wasmi = { version = "0.32", default-features = false }  # Phase 0b — agent pins exact version
+
+[features]
+default = []
+# Platform selection — exactly one must be active at build time.
+qemu = []
+vf2  = []
+# Diagnostic mode — extra tracing in trap handlers. Never ship with this on.
+debug-kernel = []
+
+[profile.release]
+panic = "abort"

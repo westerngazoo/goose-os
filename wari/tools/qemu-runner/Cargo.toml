@@ -1,0 +1,15 @@
+[package]
+name = "wari-qemu-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deterministic QEMU test harness for Wari integration tests."
+
+# Host-side binary — excluded from the workspace members list until
+# the first integration test lands in Phase 0b. Kept here as a scaffold
+# placeholder.
+
+[lints]
+workspace = true

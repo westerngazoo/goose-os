@@ -1,0 +1,17 @@
+[package]
+name = "wari-wasi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WASI Preview 1 subset + Wari-WASI extensions — host function definitions."
+
+[lints]
+workspace = true
+
+[dependencies]
+wari-abi = { path = "../abi-shared" }
+
+[features]
+default = []
