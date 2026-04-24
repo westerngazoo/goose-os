@@ -27,11 +27,13 @@ mod gooseos;
 
 global_asm!(include_str!("start.S"));
 
-// ── Net opcodes (must match kernel/src/net.rs) ────────────────
+// ── Net opcodes — mirror of `kernel/src/abi.rs::net` ─────────
 //
-// Once the migration is complete and the kernel intercept goes away,
-// this module becomes the single source of truth for the opcode
-// numbers. Until then, both copies must agree.
+// That module is the single source of truth. Any opcode change
+// must be reflected here on the same commit. (Once a shared `abi`
+// crate is extracted, this duplication goes away — at that point
+// netsrv becomes the kernel's intended home for smoltcp and the
+// kernel intercept can be removed.)
 
 const NET_STATUS:     usize = 0;
 const NET_SOCKET_TCP: usize = 1;

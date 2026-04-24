@@ -305,20 +305,23 @@ pub fn reboot() -> ! {
 pub mod net {
     use core::arch::asm;
 
-    const NET_PID: usize = 3;
+    // ABI — mirror of `kernel/src/abi.rs::net`. That module is the
+    // single source of truth; any change there must be reflected here
+    // on the same commit. (A shared `abi` crate is the long-term fix;
+    // until then, grep both files together.)
+    const NET_PID:  usize = 3;
     const SYS_CALL: usize = 4;
 
-    // Opcodes — must match kernel src/net.rs.
-    pub const NET_STATUS: usize = 0;
+    pub const NET_STATUS:     usize = 0;
     pub const NET_SOCKET_TCP: usize = 1;
     pub const NET_SOCKET_UDP: usize = 2;
-    pub const NET_BIND: usize = 3;
-    pub const NET_CONNECT: usize = 4;
-    pub const NET_LISTEN: usize = 5;
-    pub const NET_ACCEPT: usize = 6;
-    pub const NET_SEND: usize = 7;
-    pub const NET_RECV: usize = 8;
-    pub const NET_CLOSE: usize = 9;
+    pub const NET_BIND:       usize = 3;
+    pub const NET_CONNECT:    usize = 4;
+    pub const NET_LISTEN:     usize = 5;
+    pub const NET_ACCEPT:     usize = 6;
+    pub const NET_SEND:       usize = 7;
+    pub const NET_RECV:       usize = 8;
+    pub const NET_CLOSE:      usize = 9;
 
     const ERR: usize = usize::MAX;
 

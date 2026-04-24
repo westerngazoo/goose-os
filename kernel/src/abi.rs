@@ -116,6 +116,40 @@ impl SyscallError {
 /// `SyscallError::Generic.into_retval()` by construction.
 pub const ERR: usize = usize::MAX;
 
+// ── Network IPC protocol ───────────────────────────────────────
+//
+// Clients talk to the network server at PID 3 via SYS_CALL. The
+// opcode goes in a1; remaining arguments in a2..=a6 per the per-op
+// calling convention documented in `net` below.
+
+/// Opcodes for the IPC network server (PID 3). Send in `a1` of a
+/// SYS_CALL targeting `NET_SERVER_PID`.
+///
+/// Never renumber. Kernel (`net.rs`) and every userspace ABI mirror
+/// (`userspace/hello/src/gooseos.rs::net`, `userspace/netsrv/src/main.rs`)
+/// must agree byte-for-byte. Until a shared-abi crate lands, each
+/// mirror carries a link back to this module as the source of truth.
+pub mod net {
+    /// PID of the network server. Fixed by convention; the kernel
+    /// currently intercepts SYS_CALL to this PID before IPC rendezvous
+    /// runs, but clients don't need to know that.
+    pub const NET_SERVER_PID: usize = 3;
+
+    pub const NET_STATUS:     usize = 0;  // is network up? -> 1/0
+    pub const NET_SOCKET_TCP: usize = 1;  // -> tcp socket handle
+    pub const NET_SOCKET_UDP: usize = 2;  // -> udp socket handle
+    pub const NET_BIND:       usize = 3;  // (handle, port)
+    pub const NET_CONNECT:    usize = 4;  // (handle, packed_ip, port) — blocking
+    pub const NET_LISTEN:     usize = 5;  // (handle, port)
+    pub const NET_ACCEPT:     usize = 6;  // (handle) — reserved, unimplemented
+    pub const NET_SEND:       usize = 7;  // (handle, buf_va, len, packed_ip?, port?)
+    pub const NET_RECV:       usize = 8;  // (handle, buf_va, max_len) — blocking
+    pub const NET_CLOSE:      usize = 9;  // (handle)
+
+    /// Largest opcode currently defined. Dispatch tables size off this.
+    pub const NET_OP_MAX: usize = NET_CLOSE;
+}
+
 // ── Tests — pure, runnable on host ─────────────────────────────
 
 #[cfg(test)]
@@ -149,5 +183,33 @@ mod tests {
     #[test]
     fn sys_max_matches_highest_syscall() {
         assert_eq!(SYS_MAX, SYS_REBOOT);
+    }
+
+    #[test]
+    fn net_opcodes_are_distinct() {
+        use super::net::*;
+        let codes = [
+            NET_STATUS, NET_SOCKET_TCP, NET_SOCKET_UDP, NET_BIND,
+            NET_CONNECT, NET_LISTEN, NET_ACCEPT, NET_SEND,
+            NET_RECV, NET_CLOSE,
+        ];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(codes[i], codes[j], "net opcode {} collides with {}", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn net_op_max_matches_highest() {
+        use super::net::*;
+        assert_eq!(NET_OP_MAX, NET_CLOSE);
+    }
+
+    #[test]
+    fn net_server_pid_is_three() {
+        // Hard-coded in trap.rs dispatch. Pinning here so a future
+        // change has to touch two places.
+        assert_eq!(super::net::NET_SERVER_PID, 3);
     }
 }

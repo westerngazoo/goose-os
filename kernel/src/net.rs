@@ -19,23 +19,18 @@ use smoltcp::time::Instant;
 use crate::driver::NetworkDevice;
 use crate::trap::TrapFrame;
 
-// ── Network Server PID ───────────────────────────────────────
+// ── Network Server PID + opcodes ─────────────────────────────
+//
+// Single source of truth lives in `abi::net`. This re-export pattern
+// keeps call sites in this file short (`NET_RECV`, not
+// `abi::net::NET_RECV`) while guaranteeing the kernel and every
+// userspace ABI mirror read from the same constants.
 
-/// The network server is dispatched as kernel code when SYS_CALL targets this PID.
-pub const NET_SERVER_PID: usize = 3;
-
-// ── IPC Message Opcodes ──────────────────────────────────────
-
-pub const NET_STATUS:     usize = 0;  // Query: is network up?
-pub const NET_SOCKET_TCP: usize = 1;  // Create TCP socket → handle
-pub const NET_SOCKET_UDP: usize = 2;  // Create UDP socket → handle
-pub const NET_BIND:       usize = 3;  // Bind socket to port
-pub const NET_CONNECT:    usize = 4;  // Connect TCP socket
-pub const NET_LISTEN:     usize = 5;  // Listen on TCP socket
-pub const NET_ACCEPT:     usize = 6;  // Accept TCP connection
-pub const NET_SEND:       usize = 7;  // Send data
-pub const NET_RECV:       usize = 8;  // Receive data
-pub const NET_CLOSE:      usize = 9;  // Close socket
+pub use crate::abi::net::NET_SERVER_PID;
+use crate::abi::net::{
+    NET_STATUS, NET_SOCKET_TCP, NET_SOCKET_UDP, NET_BIND,
+    NET_CONNECT, NET_LISTEN, NET_SEND, NET_RECV, NET_CLOSE,
+};
 
 // ── Static Socket Storage ────────────────────────────────────
 
