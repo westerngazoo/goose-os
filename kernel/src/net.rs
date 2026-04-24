@@ -1,13 +1,26 @@
-/// Network stack — smoltcp integration with static buffers.
-///
-/// Phase B: Networking.
-///
-/// Provides:
-///   - smoltcp Device implementation wrapping VirtIO-net
-///   - Static socket set (4 TCP + 4 UDP)
-///   - IP configuration (static 10.0.2.15/24 for QEMU user-mode)
-///   - Poll function called from timer interrupt and VirtIO IRQ
-///   - IPC-based network server (userspace calls PID 3 via SYS_CALL)
+//! Network stack — smoltcp integration with static buffers.
+//!
+//! Phase B: Networking.
+//!
+//! Provides:
+//!   - smoltcp Device implementation wrapping VirtIO-net
+//!   - Static socket set (4 TCP + 4 UDP)
+//!   - IP configuration (static 10.0.2.15/24 for QEMU user-mode)
+//!   - Poll function called from timer interrupt and VirtIO IRQ
+//!   - IPC-based network server (userspace calls PID 3 via SYS_CALL)
+//!
+//! # Safety — INV-1
+//!
+//! All module-level `static mut`s (NET_IFACE, NET_SOCKETS, TCP_HANDLES,
+//! etc.) are accessed with `&mut` references from `unsafe` blocks.
+//! This triggers the 2024-edition `static_mut_refs` lint. Soundness
+//! rests on INV-1 (single hart, no re-entry into `net::` from
+//! interrupt handlers beyond the poll path which runs with interrupts
+//! disabled). Allow'd module-wide with a TODO pointing at the proper
+//! fix — migrating to `SyncUnsafeCell` — which will happen alongside
+//! the kernel→userspace smoltcp migration (netsrv Step 2b).
+
+#![allow(static_mut_refs)]
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{self, Medium};
@@ -130,6 +143,18 @@ impl phy::TxToken for VirtioTxToken {
 }
 
 // ── Global Network State ─────────────────────────────────────
+//
+// All state is `static mut`. Safety rests on INV-1 (single hart,
+// interrupts disabled during kernel execution), so `&mut` from a
+// static is sound today. The Rust 2024 `static_mut_refs` lint is a
+// future-proofing signal — when we port to SMP or to preemptable
+// kernel sections, this becomes a data race.
+//
+// Long-term fix: wrap each of these in `SyncUnsafeCell` (or a
+// proper lock once we have one) and remove the allow below. That
+// migration is bundled with the netsrv move — the kernel-side net
+// state disappears entirely in Phase C Step 2b, so polishing the
+// raw-pointer dance here is throwaway work.
 
 static mut NET_DEVICE: SmoltcpDevice = SmoltcpDevice;
 static mut NET_IFACE: Option<Interface> = None;
