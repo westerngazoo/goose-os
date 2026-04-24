@@ -368,47 +368,48 @@ pub fn handle_request(frame: &mut TrapFrame) {
     let opcode = frame.a1;
     let arg1 = frame.a2;
     let arg2 = frame.a3;
-    let _arg3 = frame.a4;
 
-    match opcode {
-        NET_STATUS => {
-            frame.a0 = 1; // Network is up
-        }
-        NET_SOCKET_TCP => {
-            frame.a0 = handle_socket_tcp();
-        }
-        NET_SOCKET_UDP => {
-            frame.a0 = handle_socket_udp();
-        }
-        NET_BIND => {
-            frame.a0 = handle_bind(arg1, arg2);
-        }
-        NET_CONNECT => {
-            // arg1 = socket handle, arg2 = packed IPv4, arg3 = port.
-            // Blocking: handle_connect manages frame.a0 directly (may reschedule).
-            handle_connect(frame, arg1, arg2, frame.a4);
-        }
-        NET_LISTEN => {
-            frame.a0 = handle_listen(arg1, arg2);
-        }
-        NET_SEND => {
-            // a2 = socket handle, a3 = buffer VA, a4 = length
-            // For UDP: a5 = packed IPv4 destination, a6 = dest port
-            // For TCP: a5/a6 are ignored (socket must be connected).
-            frame.a0 = handle_send(frame, arg1, arg2, frame.a4, frame.a5, frame.a6);
-        }
-        NET_RECV => {
-            // a2 = socket handle, a3 = buffer VA, a4 = max length.
-            // Blocking: handle_recv manages frame.a0 directly (may reschedule).
-            handle_recv(frame, arg1, arg2, frame.a4);
-        }
-        NET_CLOSE => {
-            frame.a0 = handle_close(arg1);
-        }
-        _ => {
-            frame.a0 = usize::MAX; // Unknown opcode
-        }
+    // Every handler returns a `NetOutcome`:
+    //   - Done(v)  — completed synchronously, write `v` into frame.a0
+    //   - Blocked  — handler already called process::schedule(); `frame`
+    //                now holds the next process's context and we MUST
+    //                NOT touch it further.
+    //
+    // The split used to be invisible (some handlers returned usize, some
+    // took `&mut TrapFrame`). This enum makes the two paths explicit at
+    // the call site.
+    let outcome = match opcode {
+        NET_STATUS     => NetOutcome::Done(1), // network is up
+        NET_SOCKET_TCP => NetOutcome::Done(handle_socket_tcp()),
+        NET_SOCKET_UDP => NetOutcome::Done(handle_socket_udp()),
+        NET_BIND       => NetOutcome::Done(handle_bind(arg1, arg2)),
+        NET_LISTEN     => NetOutcome::Done(handle_listen(arg1, arg2)),
+        NET_CLOSE      => NetOutcome::Done(handle_close(arg1)),
+        // Non-blocking for now; takes more args (destination IP/port) from a5/a6.
+        NET_SEND => NetOutcome::Done(
+            handle_send(arg1, arg2, frame.a4, frame.a5, frame.a6, crate::process::current_satp())
+        ),
+        // Blocking ops — handler owns frame.a0 and may reschedule.
+        NET_CONNECT    => handle_connect(frame, arg1, arg2, frame.a4),
+        NET_RECV       => handle_recv(frame, arg1, arg2, frame.a4),
+        _              => NetOutcome::Done(usize::MAX),
+    };
+
+    if let NetOutcome::Done(v) = outcome {
+        frame.a0 = v;
     }
+}
+
+/// Result of an IPC net handler.
+///
+/// Done(v) means the handler completed synchronously; the dispatcher
+/// writes v into `frame.a0`. Blocked means the handler has already
+/// called `process::schedule()` — `frame` now belongs to another
+/// process and must not be modified. `wake_blocked()` will eventually
+/// set the original caller's context.a0 when the op completes.
+enum NetOutcome {
+    Done(usize),
+    Blocked,
 }
 
 // ── Socket Operation Handlers ────────────────────────────────
@@ -497,24 +498,26 @@ fn handle_bind(handle_idx: usize, port: usize) -> usize {
 /// Blocking NET_CONNECT for TCP. Initiates the 3-way handshake, then
 /// blocks the caller until the socket reaches Established or Closed.
 ///
-/// On wake: context.a0 = 0 (success) or usize::MAX (connect failed).
-fn handle_connect(frame: &mut TrapFrame, handle_idx: usize, packed_ip: usize, port: usize) {
+/// Returns:
+///   - Done(0)          socket already Established after first poll
+///   - Done(usize::MAX) bad handle, or connect() rejected by smoltcp
+///   - Blocked          process parked; `wake_blocked` will set a0
+fn handle_connect(frame: &mut TrapFrame, handle_idx: usize, packed_ip: usize, port: usize) -> NetOutcome {
     unsafe {
         if handle_idx >= MAX_TCP_SOCKETS {
-            frame.a0 = usize::MAX;
-            return;
+            return NetOutcome::Done(usize::MAX);
         }
         let sockets = match NET_SOCKETS.as_mut() {
             Some(s) => s,
-            None => { frame.a0 = usize::MAX; return; }
+            None => return NetOutcome::Done(usize::MAX),
         };
         let iface = match NET_IFACE.as_mut() {
             Some(i) => i,
-            None => { frame.a0 = usize::MAX; return; }
+            None => return NetOutcome::Done(usize::MAX),
         };
         let handle = match TCP_HANDLES[handle_idx] {
             Some(h) => h,
-            None => { frame.a0 = usize::MAX; return; }
+            None => return NetOutcome::Done(usize::MAX),
         };
 
         let ip = Ipv4Address::new(
@@ -527,8 +530,7 @@ fn handle_connect(frame: &mut TrapFrame, handle_idx: usize, packed_ip: usize, po
         let socket = sockets.get_mut::<tcp::Socket>(handle);
         let cx = iface.context();
         if socket.connect(cx, (IpAddress::Ipv4(ip), port as u16), 49152 + handle_idx as u16).is_err() {
-            frame.a0 = usize::MAX;
-            return;
+            return NetOutcome::Done(usize::MAX);
         }
 
         // Drive the SYN out.
@@ -537,19 +539,16 @@ fn handle_connect(frame: &mut TrapFrame, handle_idx: usize, packed_ip: usize, po
         // Did it already complete (unlikely for a real remote, but loopback-ish)?
         let socket = sockets.get_mut::<tcp::Socket>(handle);
         if socket.may_send() {
-            frame.a0 = 0;
-            return;
+            return NetOutcome::Done(0);
         }
         if !socket.is_active() {
-            frame.a0 = usize::MAX;
-            return;
+            return NetOutcome::Done(usize::MAX);
         }
 
         // Block until Established (or Closed).
         let current = crate::process::CURRENT_PID;
         if current == 0 {
-            frame.a0 = 0;
-            return;
+            return NetOutcome::Done(0);
         }
         crate::process::PROCS[current].net_op = crate::process::NetOp::Connect;
         crate::process::PROCS[current].net_socket = handle_idx;
@@ -557,6 +556,7 @@ fn handle_connect(frame: &mut TrapFrame, handle_idx: usize, packed_ip: usize, po
         crate::process::PROCS[current].net_buf_len = 0;
         crate::process::PROCS[current].state = crate::process::ProcessState::BlockedNet;
         crate::sched::schedule(frame, current);
+        NetOutcome::Blocked
     }
 }
 
@@ -596,17 +596,16 @@ fn now_ms() -> i64 {
 }
 
 fn handle_send(
-    _frame: &TrapFrame,
     handle_idx: usize,
     buf_va: usize,
     len: usize,
     packed_ip: usize,
     port: usize,
+    satp: u64,
 ) -> usize {
     if len == 0 || len > STAGING_SIZE {
         return usize::MAX;
     }
-    let satp = crate::process::current_satp();
     if satp == 0 {
         return usize::MAX;
     }
@@ -724,25 +723,27 @@ fn try_recv_once(handle_idx: usize, staging: &mut [u8]) -> RecvAttempt {
     }
 }
 
-/// Blocking NET_RECV. Sets frame.a0 with the result, or reschedules
-/// the caller if no data is available right now.
+/// Blocking NET_RECV.
 ///
-/// On successful wake (from `wake_blocked`), the caller's saved
-/// context.a0 will hold the byte count, and the caller is made Ready.
+/// Returns:
+///   - Done(n)          n > 0 bytes copied into user buffer, success
+///   - Done(usize::MAX) bad args, bad handle, TCP socket closed, or
+///                      copy_to_user failed
+///   - Blocked          no data available yet; caller parked. When a
+///                      later poll sees data, `wake_blocked` will copy
+///                      it into the user buffer and set context.a0.
 fn handle_recv(
     frame: &mut TrapFrame,
     handle_idx: usize,
     buf_va: usize,
     max_len: usize,
-) {
+) -> NetOutcome {
     if max_len == 0 || max_len > STAGING_SIZE {
-        frame.a0 = usize::MAX;
-        return;
+        return NetOutcome::Done(usize::MAX);
     }
     let satp = crate::process::current_satp();
     if satp == 0 {
-        frame.a0 = usize::MAX;
-        return;
+        return NetOutcome::Done(usize::MAX);
     }
 
     // Poll so any pending RX packet is processed before we peek.
@@ -751,36 +752,30 @@ fn handle_recv(
     let staging = unsafe { &mut STAGING[..max_len] };
     match try_recv_once(handle_idx, staging) {
         RecvAttempt::Data(n) => {
-            // Got data immediately — copy out and return.
             let src = unsafe { &STAGING[..n] };
-            if crate::kvm::copy_to_user(satp, buf_va, src).is_err() {
-                frame.a0 = usize::MAX;
-            } else {
-                frame.a0 = n;
+            match crate::kvm::copy_to_user(satp, buf_va, src) {
+                Ok(()) => NetOutcome::Done(n),
+                Err(()) => NetOutcome::Done(usize::MAX),
             }
         }
-        RecvAttempt::Err => {
-            frame.a0 = usize::MAX;
-        }
+        RecvAttempt::Err => NetOutcome::Done(usize::MAX),
         RecvAttempt::Empty => {
-            // Block the caller. wake_blocked() will complete this op on
-            // a later poll, setting the caller's saved context.a0.
+            // Park the caller. wake_blocked() will complete this op on
+            // a later poll and set context.a0.
             unsafe {
                 let current = crate::process::CURRENT_PID;
                 if current == 0 {
-                    frame.a0 = 0; // kernel can't block — shouldn't happen
-                    return;
+                    // Kernel context can't block — shouldn't happen via IPC.
+                    return NetOutcome::Done(0);
                 }
                 crate::process::PROCS[current].net_op = crate::process::NetOp::Recv;
                 crate::process::PROCS[current].net_socket = handle_idx;
                 crate::process::PROCS[current].net_buf_va = buf_va;
                 crate::process::PROCS[current].net_buf_len = max_len;
                 crate::process::PROCS[current].state = crate::process::ProcessState::BlockedNet;
-                // schedule() saves `frame` into PROCS[current].context and loads
-                // the next ready process into `frame`. Must not touch frame.a0
-                // after this — it belongs to the next process now.
                 crate::sched::schedule(frame, current);
             }
+            NetOutcome::Blocked
         }
     }
 }
