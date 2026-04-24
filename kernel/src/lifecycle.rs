@@ -540,6 +540,13 @@ pub fn kill_current(frame: &mut TrapFrame, exit_code: usize) {
         PROCS[current].net_buf_va = 0;
         PROCS[current].net_buf_len = 0;
 
+        // Close any sockets the dying process still had open. Before
+        // this, handles and smoltcp SocketSet entries leaked on every
+        // exit — a long-running session would eventually exhaust the
+        // MAX_TCP/UDP_SOCKETS budgets.
+        #[cfg(feature = "net")]
+        crate::net::close_sockets_for_pid(current);
+
         // Wake any parent that's BlockedWait on us
         for i in 1..MAX_PROCS {
             if PROCS[i].state == ProcessState::BlockedWait
@@ -929,6 +936,10 @@ pub fn sys_exit(frame: &mut TrapFrame) {
         PROCS[current].net_socket = 0;
         PROCS[current].net_buf_va = 0;
         PROCS[current].net_buf_len = 0;
+
+        // Close any sockets owned by this process — mirrors kill_current.
+        #[cfg(feature = "net")]
+        crate::net::close_sockets_for_pid(current);
 
         // Wake any parent that's BlockedWait on us
         for i in 1..MAX_PROCS {

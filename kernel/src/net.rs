@@ -167,6 +167,13 @@ static mut UDP_HANDLES: [Option<SocketHandle>; MAX_UDP_SOCKETS] = [None; MAX_UDP
 static mut TCP_ALLOC_COUNT: usize = 0;
 static mut UDP_ALLOC_COUNT: usize = 0;
 
+// Per-socket owner PID. `Some(pid)` means that process owns the
+// handle and the kernel will close it if the process exits. `None`
+// means the slot is free. Indexed identically to TCP_HANDLES /
+// UDP_HANDLES — keep them in lock-step.
+static mut TCP_OWNER: [Option<usize>; MAX_TCP_SOCKETS] = [None; MAX_TCP_SOCKETS];
+static mut UDP_OWNER: [Option<usize>; MAX_UDP_SOCKETS] = [None; MAX_UDP_SOCKETS];
+
 // ── Initialization ───────────────────────────────────────────
 
 /// Initialize the smoltcp network stack.
@@ -436,10 +443,14 @@ enum NetOutcome {
 
 fn handle_socket_tcp() -> usize {
     unsafe {
-        if TCP_ALLOC_COUNT >= MAX_TCP_SOCKETS {
-            return usize::MAX;
-        }
-        let idx = TCP_ALLOC_COUNT;
+        // Find first free slot (TCP_HANDLES[i] == None). This reuses
+        // slots closed by `handle_close` or cleaned up by
+        // `close_sockets_for_pid`. Without this, TCP_ALLOC_COUNT used
+        // to only ever increase — every close leaked the slot.
+        let idx = match (0..MAX_TCP_SOCKETS).find(|&i| TCP_HANDLES[i].is_none()) {
+            Some(i) => i,
+            None => return usize::MAX,
+        };
         let sockets = match NET_SOCKETS.as_mut() {
             Some(s) => s,
             None => return usize::MAX,
@@ -450,19 +461,21 @@ fn handle_socket_tcp() -> usize {
         let socket = tcp::Socket::new(rx_buf, tx_buf);
         let handle = sockets.add(socket);
         TCP_HANDLES[idx] = Some(handle);
-        TCP_ALLOC_COUNT += 1;
+        // Record the caller as owner so we can auto-close on process exit.
+        let owner = crate::process::current_pid();
+        TCP_OWNER[idx] = if owner == 0 { None } else { Some(owner) };
+        if TCP_ALLOC_COUNT < MAX_TCP_SOCKETS { TCP_ALLOC_COUNT += 1; } // high-water mark only
 
-        // Return handle index (0-based, TCP handles are 0..MAX_TCP)
         idx
     }
 }
 
 fn handle_socket_udp() -> usize {
     unsafe {
-        if UDP_ALLOC_COUNT >= MAX_UDP_SOCKETS {
-            return usize::MAX;
-        }
-        let idx = UDP_ALLOC_COUNT;
+        let idx = match (0..MAX_UDP_SOCKETS).find(|&i| UDP_HANDLES[i].is_none()) {
+            Some(i) => i,
+            None => return usize::MAX,
+        };
         let sockets = match NET_SOCKETS.as_mut() {
             Some(s) => s,
             None => return usize::MAX,
@@ -479,9 +492,10 @@ fn handle_socket_udp() -> usize {
         let socket = udp::Socket::new(rx_buf, tx_buf);
         let handle = sockets.add(socket);
         UDP_HANDLES[idx] = Some(handle);
-        UDP_ALLOC_COUNT += 1;
+        let owner = crate::process::current_pid();
+        UDP_OWNER[idx] = if owner == 0 { None } else { Some(owner) };
+        if UDP_ALLOC_COUNT < MAX_UDP_SOCKETS { UDP_ALLOC_COUNT += 1; }
 
-        // Return handle index (TCP count + idx for UDP distinction)
         MAX_TCP_SOCKETS + idx
     }
 }
@@ -814,6 +828,15 @@ fn handle_close(handle_idx: usize) -> usize {
             };
             let socket = sockets.get_mut::<tcp::Socket>(handle);
             socket.close();
+            // Free the slot + ownership so the index can be reused.
+            // Note: smoltcp's `Socket::close()` transitions TCP to Closed
+            // but leaves the socket in the SocketSet. We null out our
+            // handle index; the SocketSet entry is effectively orphaned
+            // until a new socket is added over it. A full fix is
+            // `sockets.remove(handle)` — deferred until we confirm no
+            // dangling borrows.
+            TCP_HANDLES[handle_idx] = None;
+            TCP_OWNER[handle_idx] = None;
             0
         } else {
             let udp_idx = handle_idx - MAX_TCP_SOCKETS;
@@ -826,7 +849,46 @@ fn handle_close(handle_idx: usize) -> usize {
             };
             let socket = sockets.get_mut::<udp::Socket>(handle);
             socket.close();
+            UDP_HANDLES[udp_idx] = None;
+            UDP_OWNER[udp_idx] = None;
             0
+        }
+    }
+}
+
+/// Close every socket owned by `pid`. Called from the process-exit
+/// paths (`sys_exit` and `kill_current` in lifecycle.rs) so sockets
+/// don't leak when their owning process dies without an explicit
+/// NET_CLOSE for each.
+///
+/// Safe to call from any context — iterates the owner tables under
+/// INV-1, no IPC.
+pub fn close_sockets_for_pid(pid: usize) {
+    if !is_ready() || pid == 0 {
+        return;
+    }
+    unsafe {
+        let sockets = match NET_SOCKETS.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        for i in 0..MAX_TCP_SOCKETS {
+            if TCP_OWNER[i] == Some(pid) {
+                if let Some(h) = TCP_HANDLES[i] {
+                    sockets.get_mut::<tcp::Socket>(h).close();
+                }
+                TCP_HANDLES[i] = None;
+                TCP_OWNER[i] = None;
+            }
+        }
+        for i in 0..MAX_UDP_SOCKETS {
+            if UDP_OWNER[i] == Some(pid) {
+                if let Some(h) = UDP_HANDLES[i] {
+                    sockets.get_mut::<udp::Socket>(h).close();
+                }
+                UDP_HANDLES[i] = None;
+                UDP_OWNER[i] = None;
+            }
         }
     }
 }
