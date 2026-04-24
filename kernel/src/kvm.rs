@@ -365,67 +365,107 @@ fn bytes_to_page_end(start: usize) -> usize {
     4096 - (start & 0xFFF)
 }
 
-/// Copy `dst.len()` bytes from a user VA into a kernel slice.
-///
-/// Walks page-by-page — handles buffers that straddle 4K boundaries.
-/// Every page along the way must be mapped, U-bit set, and resolve to
-/// the allocator's heap region. Any violation aborts with `Err(())`
-/// and leaves the kernel slice partially-written (caller must discard).
-pub fn copy_from_user(satp: u64, user_va: usize, dst: &mut [u8]) -> Result<(), ()> {
-    let total = dst.len();
-    let mut done = 0usize;
-    while done < total {
-        let va = user_va.wrapping_add(done);
-        let chunk = core::cmp::min(bytes_to_page_end(va), total - done);
-        let phys = translate_user(satp, va).ok_or(())?;
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                phys as *const u8,
-                dst.as_mut_ptr().add(done),
-                chunk,
-            );
-        }
-        done += chunk;
-    }
-    Ok(())
+/// A resolved chunk of a user-buffer walk: the kernel-reachable PA and
+/// how many bytes of the overall copy land in that page.
+#[derive(Clone, Copy)]
+struct Chunk {
+    pa: usize,
+    len: usize,
 }
 
-/// Copy a kernel slice into user memory at `user_va`.
+/// Maximum pages we'll copy in a single call. Stack-sized.
+/// 32 pages × 4KB = 128 KB per copy — more than enough for any syscall
+/// buffer today. Callers that need more must chunk themselves.
+const MAX_COPY_CHUNKS: usize = 32;
+
+/// Walk-only pass: validate every page of `[user_va, user_va+total)` and
+/// return the resolved (pa, len) chunks. Requires R (via U bit for read
+/// access) always; requires W additionally if `need_write` is true.
 ///
-/// Walks page-by-page. Each page must be mapped, U + W bits set, and
-/// resolve to the allocator's heap region. Partial failure can leave
-/// some pages partially written — caller must treat as corrupted.
-pub fn copy_to_user(satp: u64, user_va: usize, src: &[u8]) -> Result<(), ()> {
-    let total = src.len();
+/// Two-pass design: this returns either the full set of chunks or an
+/// error. The copy pass (pass 2) can then execute without risk of
+/// partial writes on a later-page validation failure.
+fn walk_user_range(
+    satp: u64,
+    user_va: usize,
+    total: usize,
+    need_write: bool,
+) -> Result<([Chunk; MAX_COPY_CHUNKS], usize), ()> {
+    let mut chunks = [Chunk { pa: 0, len: 0 }; MAX_COPY_CHUNKS];
+    let mut n = 0usize;
     let mut done = 0usize;
+    let root = satp_to_root(satp);
     while done < total {
+        if n == MAX_COPY_CHUNKS {
+            return Err(()); // caller must chunk
+        }
         let va = user_va.wrapping_add(done);
         if va >= USER_VA_MAX {
             return Err(());
         }
-        let chunk = core::cmp::min(bytes_to_page_end(va), total - done);
-        let root = satp_to_root(satp);
+        let chunk_len = core::cmp::min(bytes_to_page_end(va), total - done);
         let result = crate::page_table::walk(root, va, |pa| unsafe {
             core::ptr::read_volatile(pa as *const u64)
         }).ok_or(())?;
         if !result.flags.contains(PteFlags::USER) {
             return Err(());
         }
-        if !result.flags.contains(PteFlags::WRITE) {
+        if need_write && !result.flags.contains(PteFlags::WRITE) {
             return Err(());
         }
         let page_pa = result.phys & !0xFFF;
         if !is_user_heap_pa(page_pa) {
             return Err(());
         }
+        chunks[n] = Chunk { pa: result.phys, len: chunk_len };
+        n += 1;
+        done += chunk_len;
+    }
+    Ok((chunks, n))
+}
+
+/// Copy `dst.len()` bytes from user VA to a kernel slice.
+///
+/// Two-pass: walk-and-validate every page first, then copy. Failures
+/// are detected before any byte is written, so `dst` is untouched on
+/// `Err`. Buffers up to `MAX_COPY_CHUNKS` pages (128 KB) are supported
+/// in one call; larger requires caller chunking.
+pub fn copy_from_user(satp: u64, user_va: usize, dst: &mut [u8]) -> Result<(), ()> {
+    let total = dst.len();
+    if total == 0 { return Ok(()); }
+    let (chunks, n) = walk_user_range(satp, user_va, total, false)?;
+    let mut done = 0usize;
+    for c in &chunks[..n] {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                c.pa as *const u8,
+                dst.as_mut_ptr().add(done),
+                c.len,
+            );
+        }
+        done += c.len;
+    }
+    Ok(())
+}
+
+/// Copy a kernel slice into user memory at `user_va`.
+///
+/// Two-pass (validate all → copy all). On `Err` no bytes are written.
+/// Every page must be U + W + heap-PA.
+pub fn copy_to_user(satp: u64, user_va: usize, src: &[u8]) -> Result<(), ()> {
+    let total = src.len();
+    if total == 0 { return Ok(()); }
+    let (chunks, n) = walk_user_range(satp, user_va, total, true)?;
+    let mut done = 0usize;
+    for c in &chunks[..n] {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr().add(done),
-                result.phys as *mut u8,
-                chunk,
+                c.pa as *mut u8,
+                c.len,
             );
         }
-        done += chunk;
+        done += c.len;
     }
     Ok(())
 }
