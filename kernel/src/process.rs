@@ -20,12 +20,15 @@
 //! See docs/unsafe-audit.md invariants INV-1 and INV-2 for why the
 //! `static mut` globals are sound in single-hart context.
 
-use crate::security::{MAX_PROCS, MAX_IRQS};
+use crate::security::MAX_IRQS;
 use crate::trap::TrapFrame;
 use crate::println;
 
-// Re-export for modules (e.g., net.rs) that iterate the process table.
-pub(crate) use crate::security::MAX_PROCS as MAX_PROCS_PUB;
+// Re-export `MAX_PROCS` under its canonical name. `security.rs` is the
+// source of truth; this alias lets other kernel modules iterate the
+// process table via `crate::process::MAX_PROCS` instead of having to
+// pull the constant from `security` just for a loop bound.
+pub(crate) use crate::security::MAX_PROCS;
 
 // ── Process State Machine ──────────────────────────────────────
 

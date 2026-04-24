@@ -263,7 +263,7 @@ pub fn wake_blocked() {
     if !is_ready() {
         return;
     }
-    for pid in 1..crate::process::MAX_PROCS_PUB {
+    for pid in 1..crate::process::MAX_PROCS {
         let (state, op) = unsafe {
             (
                 crate::process::PROCS[pid].state,

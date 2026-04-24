@@ -128,10 +128,32 @@ impl VirtqUsed {
     const fn zero() -> Self {
         VirtqUsed { flags: 0, idx: 0, ring: [VirtqUsedElem::zero(); QUEUE_SIZE] }
     }
+
+    /// Volatile read of `idx`, with a SeqCst fence so prior DMA writes
+    /// by the device are observed.
+    ///
+    /// The device updates `idx` via DMA. A plain field load lets LTO
+    /// hoist the value out of loops; we'd never see new completions.
+    /// Every reader in the driver funnels through this helper.
+    #[inline]
+    fn load_idx(&self) -> u16 {
+        fence(Ordering::SeqCst);
+        // SAFETY: INV-1 (single hart) + the VirtqUsed is owned by the
+        // VirtioNet static. Volatile + fence pairs with the device's
+        // write on the other side of the DMA.
+        unsafe { ptr::read_volatile(&self.idx) }
+    }
 }
 
 // ── virtio-net header ────────────────────────────────────────
 
+/// virtio-net packet header.
+///
+/// Exactly `VIRTIO_NET_HDR_SIZE` (12) bytes. In VirtIO 1.0+ modern
+/// transport (which we negotiate via VIRTIO_F_VERSION_1), `num_buffers`
+/// is always present even without VIRTIO_NET_F_MRG_RXBUF — so we
+/// include it here. Without it, `from_raw_parts(ptr, 12)` over a 10-byte
+/// struct would read 2 bytes of stack garbage into the TX header.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VirtioNetHdr {
@@ -141,14 +163,21 @@ struct VirtioNetHdr {
     gso_size:    u16,
     csum_start:  u16,
     csum_offset: u16,
-    // No num_buffers field — we don't negotiate VIRTIO_NET_F_MRG_RXBUF
+    num_buffers: u16,
 }
+
+// Compile-time assertion: struct size must match the on-wire header size.
+const _: () = assert!(
+    core::mem::size_of::<VirtioNetHdr>() == VIRTIO_NET_HDR_SIZE,
+    "VirtioNetHdr struct size must equal VIRTIO_NET_HDR_SIZE"
+);
 
 impl VirtioNetHdr {
     const fn zero() -> Self {
         VirtioNetHdr {
             flags: 0, gso_type: 0, hdr_len: 0,
             gso_size: 0, csum_start: 0, csum_offset: 0,
+            num_buffers: 0,
         }
     }
 }
@@ -277,11 +306,7 @@ impl VirtioNet {
     /// Reclaim used TX descriptors.
     fn reclaim_tx(&mut self) {
         loop {
-            fence(Ordering::SeqCst);
-            // VOLATILE: the device writes this index via DMA. A plain
-            // load lets the compiler cache the value across iterations
-            // (especially under LTO), so we'd never see new completions.
-            let used_idx = unsafe { ptr::read_volatile(&self.tx_used.idx) };
+            let used_idx = self.tx_used.load_idx();
             if self.tx_last_used == used_idx {
                 break;
             }
@@ -300,9 +325,7 @@ impl VirtioNet {
     /// Process received packets from the used ring.
     /// Returns true if any packets were received (caller should check can_receive).
     fn process_rx_used(&mut self) -> bool {
-        fence(Ordering::SeqCst);
-        let used_idx = unsafe { ptr::read_volatile(&self.rx_used.idx) };
-        used_idx != self.rx_last_used
+        self.rx_used.load_idx() != self.rx_last_used
     }
 }
 
@@ -476,8 +499,7 @@ impl NetworkDevice for VirtioNet {
             return Err(DriverError::NotReady);
         }
 
-        fence(Ordering::SeqCst);
-        let used_idx = unsafe { ptr::read_volatile(&self.rx_used.idx) };
+        let used_idx = self.rx_used.load_idx();
         if self.rx_last_used == used_idx {
             return Err(DriverError::BufferEmpty);
         }
@@ -530,9 +552,7 @@ impl NetworkDevice for VirtioNet {
         if !self.initialized {
             return false;
         }
-        fence(Ordering::SeqCst);
-        let used_idx = unsafe { ptr::read_volatile(&self.rx_used.idx) };
-        used_idx != self.rx_last_used
+        self.rx_used.load_idx() != self.rx_last_used
     }
 }
 
