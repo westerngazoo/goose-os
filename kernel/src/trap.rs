@@ -11,7 +11,7 @@
 use core::arch::{asm, global_asm};
 use crate::{plic, platform, println, kdebug, kdump_csrs};
 use crate::abi::SYS_MAX;
-use crate::{handlers, ipc, process, syscall};
+use crate::{handlers, ipc, lifecycle, process, sched, syscall};
 
 // Include the trap vector assembly
 global_asm!(include_str!("trap.S"));
@@ -184,7 +184,7 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
                     println!("    cause:  {} (code={})", cause_name, code);
                     println!("    stval:  {:#018x}", stval);
                     println!("    sepc:   {:#018x}", frame.sepc);
-                    crate::process::kill_current(frame, 128 + code);
+                    crate::lifecycle::kill_current(frame, 128 + code);
                 } else {
                     // ── S-mode fault: kernel bug, panic ──
                     //
@@ -225,7 +225,7 @@ fn handle_ecall(frame: &mut TrapFrame) {
     type Handler = fn(&mut TrapFrame);
     static HANDLERS: [Handler; SYS_MAX + 1] = [
         handlers::sys_putchar,      // 0  SYS_PUTCHAR
-        process::sys_exit,          // 1  SYS_EXIT
+        lifecycle::sys_exit,        // 1  SYS_EXIT
         ipc::sys_send,              // 2  SYS_SEND
         ipc::sys_receive,           // 3  SYS_RECEIVE
         handlers::sys_call,         // 4  SYS_CALL (with net intercept)
@@ -235,9 +235,9 @@ fn handle_ecall(frame: &mut TrapFrame) {
         syscall::sys_alloc_pages,   // 8  SYS_ALLOC_PAGES
         syscall::sys_free_pages,    // 9  SYS_FREE_PAGES
         syscall::sys_spawn,         // 10 SYS_SPAWN
-        process::sys_wait,          // 11 SYS_WAIT
+        lifecycle::sys_wait,        // 11 SYS_WAIT
         process::sys_getpid,        // 12 SYS_GETPID
-        process::sys_yield,         // 13 SYS_YIELD
+        sched::sys_yield,           // 13 SYS_YIELD
         syscall::sys_irq_register,  // 14 SYS_IRQ_REGISTER
         syscall::sys_irq_ack,       // 15 SYS_IRQ_ACK
         handlers::sys_reboot,       // 16 SYS_REBOOT
@@ -332,7 +332,7 @@ fn handle_external(frame: &mut TrapFrame) {
         // If we're in kernel idle (S-mode), schedule the woken process immediately
         if frame.sstatus & (1 << 8) != 0 {
             kdebug!("external: scheduling from idle");
-            crate::process::schedule_from_idle(frame);
+            crate::sched::schedule_from_idle(frame);
         }
         return;
     }
@@ -397,10 +397,10 @@ fn handle_timer(frame: &mut TrapFrame) {
     // Preempt or schedule based on where we came from.
     if frame.sstatus & (1 << 8) == 0 {
         // From U-mode — preempt current user process (round-robin)
-        crate::process::preempt(frame);
+        crate::sched::preempt(frame);
     } else {
         // From S-mode (kernel idle) — check if any process woke up
-        crate::process::schedule_from_idle(frame);
+        crate::sched::schedule_from_idle(frame);
     }
 }
 

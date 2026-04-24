@@ -35,6 +35,10 @@ mod kvm;
 #[cfg(not(test))]
 mod process;
 #[cfg(not(test))]
+mod sched;
+#[cfg(not(test))]
+mod lifecycle;
+#[cfg(not(test))]
 mod ipc;
 #[cfg(not(test))]
 mod syscall;

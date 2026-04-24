@@ -27,7 +27,7 @@
 //! Stages 6 and 7 are feature-gated. Stage 8 is the terminal stage;
 //! control enters the scheduler and does not return to `run()`.
 
-use crate::{kvm, page_alloc, platform, plic, println, process, trap, uart};
+use crate::{kvm, lifecycle, page_alloc, platform, plic, println, trap, uart};
 
 /// Boot sequence entry point. Called from `kmain` in main.rs.
 ///
@@ -230,5 +230,5 @@ fn stage_wasm_test() -> ! {
 /// the interrupt context without returning to `run()`.
 #[cfg(not(feature = "wasm-test"))]
 fn stage_user() -> ! {
-    process::launch()
+    lifecycle::launch()
 }

@@ -8,7 +8,8 @@
 ///
 /// No kernel-side message queues, no allocation.
 
-use crate::process::{PROCS, CURRENT_PID, ProcessState, schedule};
+use crate::process::{PROCS, CURRENT_PID, ProcessState};
+use crate::sched::schedule;
 use crate::security::{self, MAX_PROCS};
 use crate::trap::TrapFrame;
 

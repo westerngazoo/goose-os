@@ -556,7 +556,7 @@ fn handle_connect(frame: &mut TrapFrame, handle_idx: usize, packed_ip: usize, po
         crate::process::PROCS[current].net_buf_va = 0;
         crate::process::PROCS[current].net_buf_len = 0;
         crate::process::PROCS[current].state = crate::process::ProcessState::BlockedNet;
-        crate::process::schedule(frame, current);
+        crate::sched::schedule(frame, current);
     }
 }
 
@@ -779,7 +779,7 @@ fn handle_recv(
                 // schedule() saves `frame` into PROCS[current].context and loads
                 // the next ready process into `frame`. Must not touch frame.a0
                 // after this — it belongs to the next process now.
-                crate::process::schedule(frame, current);
+                crate::sched::schedule(frame, current);
             }
         }
     }
