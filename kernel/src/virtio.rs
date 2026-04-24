@@ -64,7 +64,11 @@ const VRING_DESC_F_WRITE:    u16 = 2;
 const RX_BUFFERS: usize = 32;
 const TX_BUFFERS: usize = 16;
 const PACKET_SIZE: usize = 1514;   // Max Ethernet frame
-const VIRTIO_NET_HDR_SIZE: usize = 10; // virtio-net header (no mergeable buffers)
+// virtio-net header size. In VirtIO 1.0+ (modern, with VIRTIO_F_VERSION_1)
+// this struct is always 12 bytes — there's a num_buffers field even without
+// VIRTIO_NET_F_MRG_RXBUF. Legacy transport was 10 bytes. We negotiate
+// VERSION_1, so use 12.
+const VIRTIO_NET_HDR_SIZE: usize = 12;
 const BUF_SIZE: usize = PACKET_SIZE + VIRTIO_NET_HDR_SIZE;
 
 // Queue size — must be power of 2, >= RX_BUFFERS + TX_BUFFERS
@@ -273,7 +277,11 @@ impl VirtioNet {
     /// Reclaim used TX descriptors.
     fn reclaim_tx(&mut self) {
         loop {
-            let used_idx = self.tx_used.idx;
+            fence(Ordering::SeqCst);
+            // VOLATILE: the device writes this index via DMA. A plain
+            // load lets the compiler cache the value across iterations
+            // (especially under LTO), so we'd never see new completions.
+            let used_idx = unsafe { ptr::read_volatile(&self.tx_used.idx) };
             if self.tx_last_used == used_idx {
                 break;
             }
@@ -292,7 +300,8 @@ impl VirtioNet {
     /// Process received packets from the used ring.
     /// Returns true if any packets were received (caller should check can_receive).
     fn process_rx_used(&mut self) -> bool {
-        let used_idx = self.rx_used.idx;
+        fence(Ordering::SeqCst);
+        let used_idx = unsafe { ptr::read_volatile(&self.rx_used.idx) };
         used_idx != self.rx_last_used
     }
 }
@@ -467,7 +476,8 @@ impl NetworkDevice for VirtioNet {
             return Err(DriverError::NotReady);
         }
 
-        let used_idx = self.rx_used.idx;
+        fence(Ordering::SeqCst);
+        let used_idx = unsafe { ptr::read_volatile(&self.rx_used.idx) };
         if self.rx_last_used == used_idx {
             return Err(DriverError::BufferEmpty);
         }
@@ -520,7 +530,9 @@ impl NetworkDevice for VirtioNet {
         if !self.initialized {
             return false;
         }
-        self.rx_used.idx != self.rx_last_used
+        fence(Ordering::SeqCst);
+        let used_idx = unsafe { ptr::read_volatile(&self.rx_used.idx) };
+        used_idx != self.rx_last_used
     }
 }
 
