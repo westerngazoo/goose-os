@@ -235,6 +235,15 @@ endif
 	sync
 	@echo ">>> Copied $(KERNEL_BIN) to $(SD)"
 
+# ── Host-side pure-module tests ─────────────────────────────
+
+# Pure kernel modules (page_table, page_alloc, security, wasm, wasi,
+# abi) have `#[cfg(test)]` unit tests that compile against std on the
+# host. Runs in <1s; expected to pass before every commit that
+# touches a pure module.
+test-host:
+	cd kernel && cargo test --bin goose-os --target x86_64-unknown-linux-gnu
+
 # ── Common ──────────────────────────────────────────────────
 
 clean:

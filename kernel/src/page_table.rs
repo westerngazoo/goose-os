@@ -527,6 +527,156 @@ mod tests {
         let asid = (satp >> 44) & 0xFFFF;
         assert_eq!(asid, 0);
     }
+
+    // ── walk() tests ────────────────────────────────────────────
+    //
+    // `walk` takes a read closure, which is exactly the hook we need
+    // for host-side testing: we build a fake three-level Sv39 tree in
+    // a HashMap and give `walk` a closure that reads from it.
+
+    // Construct a leaf PTE (V + R + W + U + A + D) at `page_pa`.
+    fn user_leaf(page_pa: usize) -> u64 {
+        Pte::new(page_pa, PteFlags::USER
+            .union(PteFlags::READ)
+            .union(PteFlags::WRITE)
+            .union(PteFlags::VALID)
+            .union(PteFlags::ACCESS)
+            .union(PteFlags::DIRTY)).bits()
+    }
+
+    fn branch(child_pa: usize) -> u64 {
+        Pte::branch(child_pa).bits()
+    }
+
+    // Small fake memory: maps physical PTE slots to raw 64-bit values.
+    // Keys are absolute PAs (the PTE slot address). We never write a
+    // leaf's *target page* data here — `walk` only reads PTEs, not
+    // user payload.
+    struct FakeMem(std::collections::HashMap<usize, u64>);
+
+    impl FakeMem {
+        fn new() -> Self { FakeMem(std::collections::HashMap::new()) }
+        fn set_pte(&mut self, table_pa: usize, idx: usize, v: u64) {
+            self.0.insert(table_pa + idx * 8, v);
+        }
+        fn reader(&self) -> impl FnMut(usize) -> u64 + '_ {
+            |pa| *self.0.get(&pa).unwrap_or(&0)
+        }
+    }
+
+    #[test]
+    fn walk_unmapped_va_returns_none() {
+        let mem = FakeMem::new();
+        // Root at 0x1000 with no PTEs — any VA walks to an invalid slot.
+        let root_pa = 0x1000;
+        assert!(walk(root_pa, 0x1234_5000, mem.reader()).is_none());
+    }
+
+    #[test]
+    fn walk_single_valid_4k_mapping_resolves_pa_and_flags() {
+        let mut mem = FakeMem::new();
+        let root_pa = 0x1000;   // root table
+        let l1_pa   = 0x2000;   // level-1 table
+        let l0_pa   = 0x3000;   // level-0 table
+        let page_pa = 0x80_0000; // the user page we're mapping
+
+        // VA we want to resolve:  vpn2=5  vpn1=7  vpn0=42  offset=0x123
+        let va = (5 << 30) | (7 << 21) | (42 << 12) | 0x123;
+
+        mem.set_pte(root_pa, 5, branch(l1_pa));
+        mem.set_pte(l1_pa,   7, branch(l0_pa));
+        mem.set_pte(l0_pa,  42, user_leaf(page_pa));
+
+        let r = walk(root_pa, va, mem.reader()).expect("walk should resolve");
+        // walk returns page_pa + offset.
+        assert_eq!(r.phys, page_pa + 0x123);
+        assert!(r.flags.contains(PteFlags::USER));
+        assert!(r.flags.contains(PteFlags::READ));
+        assert!(r.flags.contains(PteFlags::WRITE));
+    }
+
+    #[test]
+    fn walk_invalid_intermediate_pte_returns_none() {
+        let mut mem = FakeMem::new();
+        let root_pa = 0x1000;
+        // vpn2=5 branches, but vpn1=7 slot is zero (invalid).
+        mem.set_pte(root_pa, 5, branch(0x2000));
+        let va = (5 << 30) | (7 << 21);
+        assert!(walk(root_pa, va, mem.reader()).is_none());
+    }
+
+    #[test]
+    fn walk_rejects_superpage_2m() {
+        // A "leaf" PTE at level 1 (2MB superpage) — we don't support
+        // superpages in the Phase B walker; it should return None.
+        let mut mem = FakeMem::new();
+        let root_pa = 0x1000;
+        let l1_pa   = 0x2000;
+        mem.set_pte(root_pa, 5, branch(l1_pa));
+        // Level-1 slot holds a leaf (has R/W/X bits) — rejected.
+        mem.set_pte(l1_pa, 7, user_leaf(0x40_0000));
+
+        let va = (5 << 30) | (7 << 21) | (42 << 12);
+        assert!(walk(root_pa, va, mem.reader()).is_none());
+    }
+
+    #[test]
+    fn walk_rejects_superpage_1g() {
+        // A leaf PTE at level 2 (1GB superpage) is also rejected.
+        let mut mem = FakeMem::new();
+        let root_pa = 0x1000;
+        mem.set_pte(root_pa, 5, user_leaf(0x4000_0000));
+
+        let va = 5 << 30;
+        assert!(walk(root_pa, va, mem.reader()).is_none());
+    }
+
+    #[test]
+    fn walk_preserves_page_offset_in_phys() {
+        // Different offsets in the same page should resolve to distinct
+        // PAs that share the same page base.
+        let mut mem = FakeMem::new();
+        let root_pa = 0x1000;
+        let l1_pa   = 0x2000;
+        let l0_pa   = 0x3000;
+        let page_pa = 0x80_0000;
+        mem.set_pte(root_pa, 0, branch(l1_pa));
+        mem.set_pte(l1_pa,   0, branch(l0_pa));
+        mem.set_pte(l0_pa,   0, user_leaf(page_pa));
+
+        let a = walk(root_pa, 0x000, mem.reader()).unwrap();
+        let b = walk(root_pa, 0x123, mem.reader()).unwrap();
+        let c = walk(root_pa, 0xFFF, mem.reader()).unwrap();
+        assert_eq!(a.phys, page_pa + 0x000);
+        assert_eq!(b.phys, page_pa + 0x123);
+        assert_eq!(c.phys, page_pa + 0xFFF);
+    }
+
+    #[test]
+    fn walk_kernel_mapping_lacks_user_bit() {
+        // A leaf without the U bit is a valid kernel mapping. The
+        // walker still resolves it (it's not the walker's job to
+        // enforce U access — that's translate_user's). Flags reflect
+        // the PTE.
+        let mut mem = FakeMem::new();
+        let root_pa = 0x1000;
+        let l1_pa   = 0x2000;
+        let l0_pa   = 0x3000;
+        let page_pa = 0x80_0000;
+        let kernel_leaf = Pte::new(page_pa, PteFlags::READ
+            .union(PteFlags::WRITE)
+            .union(PteFlags::VALID)
+            .union(PteFlags::ACCESS)
+            .union(PteFlags::DIRTY)).bits(); // no USER bit
+
+        mem.set_pte(root_pa, 0, branch(l1_pa));
+        mem.set_pte(l1_pa,   0, branch(l0_pa));
+        mem.set_pte(l0_pa,   0, kernel_leaf);
+
+        let r = walk(root_pa, 0x0, mem.reader()).unwrap();
+        assert!(!r.flags.contains(PteFlags::USER));
+        assert!(r.flags.contains(PteFlags::READ));
+    }
 }
 
 // ── Kani Proofs ─────────────────────────────────────────────────
