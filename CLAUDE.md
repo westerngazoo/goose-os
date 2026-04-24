@@ -1,3 +1,15 @@
+# ⚠️ If you are working on Wari, this file does not apply.
+
+**The active project in this repo is `/wari/`.** Its rules, architecture,
+and co-architect protocol live in [`/wari/CLAUDE.md`](./wari/CLAUDE.md).
+Work on Wari begins with `cd wari/` and reads that document as ground truth.
+
+This file (`/CLAUDE.md`) covers the **goose-os** Volume-1 project, which is
+frozen as a reference implementation for Wari to cherry-pick from. Only
+goose-os maintenance work uses the rules below.
+
+---
+
 ## graphify
 
 This project has a graphify knowledge graph at graphify-out/.
