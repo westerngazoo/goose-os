@@ -29,8 +29,12 @@ pub enum KernelError {
     OutOfHandles,
     /// Page/handle/capability not mapped or not owned by caller.
     NotMapped,
-    /// WASM module failed validation (Phase 0+).
-    BadWasm,
+    /// ELF parse/validation failure — inherited from the goose-os ABI
+    /// for discriminant stability (see `wari_abi::SyscallError::BadElf`).
+    /// Unreachable in the Wari ship kernel per R7 (no ELF loader);
+    /// retained only so a future `dev-native` testing path, if ever
+    /// reintroduced, has a pre-allocated error slot.
+    BadElf,
     /// Driver-layer failure — see driver-specific log line for detail.
     DriverError,
 }
@@ -51,7 +55,7 @@ impl KernelError {
             KernelError::OutOfPages       => E::OutOfResources,
             KernelError::OutOfHandles     => E::OutOfResources,
             KernelError::NotMapped        => E::NotMapped,
-            KernelError::BadWasm          => E::BadWasm,
+            KernelError::BadElf           => E::BadElf,
             KernelError::DriverError      => E::Generic,
         }
     }

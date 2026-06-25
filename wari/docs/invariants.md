@@ -132,6 +132,22 @@ with the alignment fix.
 
 ---
 
+## Non-contributing crates (audit-exempt)
+
+Crates in this list contain **no `unsafe`** and **no MMIO**. They are
+pure data and logic, host-testable, and therefore introduce no
+invariants. Phase-gate audits skip them for unsafe-block coverage but
+still review them for R4 (API contracts) and test coverage.
+
+| Crate       | Rationale |
+|-------------|-----------|
+| `wari-abi`  | Pure ABI constants + `SyscallError` enum + `into_retval`. No `unsafe`, no allocation, no MMIO. Host-testable with `cargo test -p wari-abi`. |
+
+If any of these crates ever grow an `unsafe` block, they move out of
+this list and every block gets an INV-N citation the same PR it lands.
+
+---
+
 ## Enforcement
 
 - `cargo clippy -- -D warnings` with `undocumented_unsafe_blocks = "warn"`
